@@ -316,8 +316,10 @@ fn rle_frame(
         return Err("RLE header is truncated".into());
     }
     let header: Vec<usize> = data[..64]
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c) as usize)
         .collect();
     let bytes_per_sample = (l.bits_allocated / 8).max(1) as usize;
     let segments = header[0];
@@ -490,7 +492,8 @@ fn convert(
         let ybr = l.photometric.starts_with("YBR_FULL");
         if let (Raw::Bytes(b), 8, false, false) = (&raw, ba, l.planar, ybr) {
             // The common case (ultrasound, secondary capture): plain 8-bit RGB.
-            for (dst, src) in rgba.chunks_exact_mut(4).zip(b.chunks_exact(l.samples)) {
+            let pixels = rgba.as_chunks_mut::<4>().0.iter_mut();
+            for (dst, src) in pixels.zip(b.chunks_exact(l.samples)) {
                 dst[..3].copy_from_slice(&src[..3]);
             }
             return Ok(make(Pixels::Rgba(rgba), 0.0, 255.0, false));
@@ -560,8 +563,10 @@ impl Palette {
                     if bits == 8 && b.len() as i64 == desc[0].max(1) {
                         b.iter().map(|&x| x as u16).collect()
                     } else {
-                        b.chunks_exact(2)
-                            .map(|w| u16::from_le_bytes([w[0], w[1]]))
+                        b.as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|w| u16::from_le_bytes(*w))
                             .collect()
                     }
                 }
