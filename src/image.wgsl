@@ -9,7 +9,7 @@ struct Uniforms {
     tex: vec4<f32>,
     // Window centre, window width, value scale, invert (0 or 1).
     wl: vec4<f32>,
-    // Colour (0 or 1), smooth (0 or 1), sRGB target (0 or 1), unused.
+    // Colour (0 or 1), smooth (0 or 1), sRGB target (0 or 1), colour map.
     mode: vec4<f32>,
 };
 
@@ -50,12 +50,6 @@ fn bilinear(t: vec2<f32>) -> vec3<f32> {
     return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
 }
 
-fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
-    let lo = c / 12.92;
-    let hi = pow((c + 0.055) / 1.055, vec3<f32>(2.4));
-    return select(hi, lo, c <= vec3<f32>(0.04045));
-}
-
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let t = in.uv * u.tex.xy;
@@ -89,6 +83,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var g = clamp((x - (u.wl.x - 0.5 * width)) / width, vec3<f32>(0.0), vec3<f32>(1.0));
     if u.wl.w > 0.5 {
         g = 1.0 - g;
+    }
+    if u.mode.x < 0.5 {
+        g = colormap(g.r, u.mode.w);
     }
     if u.mode.z > 0.5 {
         g = srgb_to_linear(g);

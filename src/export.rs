@@ -15,6 +15,7 @@ use openh264::encoder::{
 use openh264::formats::YUVBuffer;
 use rayon::prelude::*;
 
+use crate::colormap::Colormap;
 use crate::decode::{Frame, Pixels, decode_frame};
 use crate::mp4;
 use crate::scan::{FrameRef, open_dicom};
@@ -33,6 +34,16 @@ pub struct Settings {
     pub window: Option<(f32, f32)>,
     pub invert: bool,
     pub smooth: bool,
+    pub colormap: Colormap,
+}
+
+/// How frames are drawn: the viewer's display settings.
+#[derive(Clone, Copy)]
+struct Look {
+    window: (f32, f32),
+    invert: bool,
+    smooth: bool,
+    colormap: Colormap,
 }
 
 pub struct Summary {
@@ -122,7 +133,12 @@ pub fn write_video(
 
     let head = load(first)?;
     let (width, height) = output_size(head.width, head.height);
-    let window = settings.window.unwrap_or(head.window);
+    let look = Look {
+        window: settings.window.unwrap_or(head.window),
+        invert: settings.invert,
+        smooth: settings.smooth,
+        colormap: settings.colormap,
+    };
     drop(head);
 
     let fps = settings.fps.clamp(0.5, 240.0);
@@ -151,14 +167,7 @@ pub fn write_video(
             .par_iter()
             .map(|f| {
                 let frame = load(f).ok()?;
-                Some(to_yuv(
-                    &frame,
-                    width,
-                    height,
-                    window,
-                    settings.invert,
-                    settings.smooth,
-                ))
+                Some(to_yuv(&frame, width, height, &look))
             })
             .collect();
         for image in images {
@@ -247,20 +256,17 @@ fn black_yuv(width: usize, height: usize) -> Vec<u8> {
 }
 
 /// Draw a frame into an I420 buffer (limited range, BT.709) the way the
-/// viewer's shader does: fit and centre it, sample, then apply the window.
-fn to_yuv(
-    frame: &Frame,
-    width: usize,
-    height: usize,
-    (centre, window_width): (f32, f32),
-    invert: bool,
-    smooth: bool,
-) -> Vec<u8> {
+/// viewer's shader does: fit and centre it, sample, apply the window, then
+/// the colour map.
+fn to_yuv(frame: &Frame, width: usize, height: usize, look: &Look) -> Vec<u8> {
+    let (centre, window_width) = look.window;
+    let smooth = look.smooth;
     let (fw, fh) = (frame.width as f32, frame.height as f32);
     let scale = (width as f32 / fw).min(height as f32 / fh);
     let left = (width as f32 - fw * scale) / 2.0;
     let top = (height as f32 - fh * scale) / 2.0;
-    let invert = frame.inverted != invert;
+    let invert = frame.inverted != look.invert;
+    let colour = frame.is_color();
     let ww = window_width.max(1e-6);
     let low = centre - 0.5 * ww;
     // Several samples per output pixel when shrinking, as in the shader.
@@ -315,16 +321,20 @@ fn to_yuv(
             }
             acc.map(|v| v / (taps * taps) as f32)
         };
-        raw.map(|v| {
+        let shaded = raw.map(|v| {
             let g = ((v - low) / ww).clamp(0.0, 1.0);
             if invert { 1.0 - g } else { g }
-        })
+        });
+        if colour {
+            shaded
+        } else {
+            look.colormap.apply(shaded[0])
+        }
     };
 
     let mut yuv = vec![0u8; width * height * 3 / 2];
     let (luma, chroma) = yuv.split_at_mut(width * height);
     let (cb_plane, cr_plane) = chroma.split_at_mut(width * height / 4);
-    let colour = frame.is_color();
     for by in 0..height / 2 {
         for bx in 0..width / 2 {
             let mut sum = [0.0f32; 3];
@@ -336,14 +346,8 @@ fn to_yuv(
                 sum = [sum[0] + r, sum[1] + g, sum[2] + b];
             }
             let [r, g, b] = sum.map(|v| v / 4.0);
-            let (cb, cr) = if colour {
-                (
-                    -0.114_57 * r - 0.385_43 * g + 0.5 * b,
-                    0.5 * r - 0.454_15 * g - 0.045_85 * b,
-                )
-            } else {
-                (0.0, 0.0)
-            };
+            let cb = -0.114_57 * r - 0.385_43 * g + 0.5 * b;
+            let cr = 0.5 * r - 0.454_15 * g - 0.045_85 * b;
             let i = by * (width / 2) + bx;
             cb_plane[i] = (128.0 + 224.0 * cb).round().clamp(16.0, 240.0) as u8;
             cr_plane[i] = (128.0 + 224.0 * cr).round().clamp(16.0, 240.0) as u8;
@@ -356,6 +360,15 @@ fn to_yuv(
 mod tests {
     use super::*;
 
+    fn look(window: (f32, f32), invert: bool, smooth: bool) -> Look {
+        Look {
+            window,
+            invert,
+            smooth,
+            colormap: Colormap::Grey,
+        }
+    }
+
     fn gray(width: u32, height: u32, values: Vec<f32>) -> Frame {
         Frame {
             id: 0,
@@ -366,6 +379,8 @@ mod tests {
             max: 255.0,
             window: (127.5, 255.0),
             inverted: false,
+            spacing: None,
+            position: None,
         }
     }
 
@@ -381,11 +396,11 @@ mod tests {
     fn applies_the_window_and_inversion() {
         // Values 0, 50, 100, 200 through a window from 0 to 200.
         let frame = gray(2, 2, vec![0.0, 50.0, 100.0, 200.0]);
-        let yuv = to_yuv(&frame, 2, 2, (100.0, 200.0), false, false);
+        let yuv = to_yuv(&frame, 2, 2, &look((100.0, 200.0), false, false));
         assert_eq!(&yuv[..4], &[16, 71, 126, 235]);
         assert_eq!(&yuv[4..], &[128, 128]);
 
-        let inverted = to_yuv(&frame, 2, 2, (100.0, 200.0), true, false);
+        let inverted = to_yuv(&frame, 2, 2, &look((100.0, 200.0), true, false));
         assert_eq!(&inverted[..4], &[235, 180, 126, 16]);
     }
 
@@ -396,17 +411,32 @@ mod tests {
             window: (127.5, 255.0),
             ..gray(2, 2, vec![])
         };
-        let yuv = to_yuv(&frame, 2, 2, (127.5, 255.0), false, false);
+        let yuv = to_yuv(&frame, 2, 2, &look((127.5, 255.0), false, false));
         // Pure red in BT.709 limited range is Y 63, Cb 102, Cr 240.
         assert_eq!(&yuv[..4], &[63; 4]);
         assert_eq!(&yuv[4..], &[102, 240]);
     }
 
     #[test]
+    fn colour_maps_apply_to_greyscale() {
+        // Full brightness through hot iron is white; half is orange-red.
+        let frame = gray(2, 2, vec![255.0, 255.0, 127.5, 127.5]);
+        let hot = Look {
+            colormap: Colormap::HotIron,
+            ..look((127.5, 255.0), false, false)
+        };
+        let yuv = to_yuv(&frame, 2, 2, &hot);
+        assert_eq!(&yuv[..2], &[235, 235]);
+        // Half brightness is (1, 0.5, 0): Y = 16 + 219 * (0.2126 + 0.3576).
+        assert_eq!(&yuv[2..4], &[141, 141]);
+        assert!(yuv[5] > 128, "red pushes Cr above neutral");
+    }
+
+    #[test]
     fn small_images_are_centred_with_black_bars() {
         // A 2x1 image drawn into 4x4: rows 0 and 3 are bars, 1 and 2 the image.
         let frame = gray(2, 1, vec![255.0, 255.0]);
-        let yuv = to_yuv(&frame, 4, 4, (127.5, 255.0), false, false);
+        let yuv = to_yuv(&frame, 4, 4, &look((127.5, 255.0), false, false));
         assert_eq!(&yuv[0..4], &[16; 4]);
         assert_eq!(&yuv[4..12], &[235; 8]);
         assert_eq!(&yuv[12..16], &[16; 4]);
@@ -418,7 +448,12 @@ mod tests {
         let frames: Vec<Vec<u8>> = (0..5)
             .map(|k| {
                 let values = (0..64 * 64).map(|i| ((i + k * 7) % 256) as f32).collect();
-                to_yuv(&gray(64, 64, values), 64, 64, (127.5, 255.0), false, true)
+                to_yuv(
+                    &gray(64, 64, values),
+                    64,
+                    64,
+                    &look((127.5, 255.0), false, true),
+                )
             })
             .collect();
         let config = encoder_config(64, 64, 15.0);

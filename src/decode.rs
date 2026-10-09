@@ -32,6 +32,22 @@ pub struct Frame {
     pub window: (f32, f32),
     /// MONOCHROME1: low values are displayed white.
     pub inverted: bool,
+    /// Physical size of a pixel, when the file gives one.
+    pub spacing: Option<Spacing>,
+    /// Position along the slice normal in millimetres, for 3D spacing.
+    pub position: Option<f32>,
+}
+
+/// Millimetres per pixel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spacing {
+    /// Between rows, so the vertical size of a pixel.
+    pub row: f32,
+    /// Between columns, so the horizontal size of a pixel.
+    pub col: f32,
+    /// Measured at the detector of a projection image (Imager Pixel
+    /// Spacing), so anatomy in the beam is magnified by a few per cent.
+    pub at_detector: bool,
 }
 
 impl Frame {
@@ -166,6 +182,8 @@ pub fn decode_frame(obj: &DefaultDicomObject, frame: u32, max_dim: u32) -> Resul
     {
         out.window = w;
     }
+    out.spacing = pixel_spacing(obj, frame);
+    out.position = slice_position(obj, frame);
 
     Ok(downsample(out, max_dim))
 }
@@ -204,8 +222,18 @@ fn functional(
     group: dicom_core::Tag,
     tag: dicom_core::Tag,
 ) -> Option<f64> {
-    fn first(o: &InMemDicomObject, tag: dicom_core::Tag) -> Option<f64> {
-        o.get(tag)?.to_multi_float64().ok()?.first().copied()
+    functional_values(obj, frame, group, tag)?.first().copied()
+}
+
+/// Like [`functional`], but returns every value of the attribute.
+fn functional_values(
+    obj: &DefaultDicomObject,
+    frame: u32,
+    group: dicom_core::Tag,
+    tag: dicom_core::Tag,
+) -> Option<Vec<f64>> {
+    fn values(o: &InMemDicomObject, tag: dicom_core::Tag) -> Option<Vec<f64>> {
+        Some(o.get(tag)?.to_multi_float64().ok()?).filter(|v| !v.is_empty())
     }
     fn nested(
         o: &InMemDicomObject,
@@ -213,11 +241,11 @@ fn functional(
         index: usize,
         group: dicom_core::Tag,
         tag: dicom_core::Tag,
-    ) -> Option<f64> {
+    ) -> Option<Vec<f64>> {
         let item = o.get(seq)?.items()?.get(index)?;
-        first(item.get(group)?.items()?.first()?, tag)
+        values(item.get(group)?.items()?.first()?, tag)
     }
-    first(obj, tag)
+    values(obj, tag)
         .or_else(|| {
             nested(
                 obj,
@@ -228,6 +256,79 @@ fn functional(
             )
         })
         .or_else(|| nested(obj, tags::SHARED_FUNCTIONAL_GROUPS_SEQUENCE, 0, group, tag))
+}
+
+/// Pixel size from Pixel Spacing (including enhanced multi-frame groups),
+/// then Imager Pixel Spacing, then the first ultrasound region in cm.
+fn pixel_spacing(obj: &DefaultDicomObject, frame: u32) -> Option<Spacing> {
+    let pair = |v: Vec<f64>, at_detector| {
+        (v.len() >= 2 && v[0] > 0.0 && v[1] > 0.0).then(|| Spacing {
+            row: v[0] as f32,
+            col: v[1] as f32,
+            at_detector,
+        })
+    };
+    if let Some(s) = functional_values(
+        obj,
+        frame,
+        tags::PIXEL_MEASURES_SEQUENCE,
+        tags::PIXEL_SPACING,
+    )
+    .and_then(|v| pair(v, false))
+    {
+        return Some(s);
+    }
+    if let Some(s) = obj
+        .get(tags::IMAGER_PIXEL_SPACING)
+        .and_then(|e| e.to_multi_float64().ok())
+        .and_then(|v| pair(v, true))
+    {
+        return Some(s);
+    }
+    const CENTIMETRES: u32 = 3;
+    obj.get(tags::SEQUENCE_OF_ULTRASOUND_REGIONS)?
+        .items()?
+        .iter()
+        .find_map(|region| {
+            let unit = |t| region.get(t)?.to_int::<u32>().ok();
+            let delta = |t| region.get(t)?.to_float64().ok().map(f64::abs);
+            if unit(tags::PHYSICAL_UNITS_X_DIRECTION)? != CENTIMETRES
+                || unit(tags::PHYSICAL_UNITS_Y_DIRECTION)? != CENTIMETRES
+            {
+                return None;
+            }
+            let (dx, dy) = (
+                delta(tags::PHYSICAL_DELTA_X)?,
+                delta(tags::PHYSICAL_DELTA_Y)?,
+            );
+            pair(vec![dy * 10.0, dx * 10.0], false)
+        })
+}
+
+/// Distance of the slice along its normal, from Image Position and Image
+/// Orientation (Patient), including enhanced multi-frame groups.
+fn slice_position(obj: &DefaultDicomObject, frame: u32) -> Option<f32> {
+    let p = functional_values(
+        obj,
+        frame,
+        tags::PLANE_POSITION_SEQUENCE,
+        tags::IMAGE_POSITION_PATIENT,
+    )?;
+    let o = functional_values(
+        obj,
+        frame,
+        tags::PLANE_ORIENTATION_SEQUENCE,
+        tags::IMAGE_ORIENTATION_PATIENT,
+    )?;
+    if p.len() < 3 || o.len() < 6 {
+        return None;
+    }
+    let n = [
+        o[1] * o[5] - o[2] * o[4],
+        o[2] * o[3] - o[0] * o[5],
+        o[0] * o[4] - o[1] * o[3],
+    ];
+    Some((p[0] * n[0] + p[1] * n[1] + p[2] * n[2]) as f32)
 }
 
 enum Raw<'a> {
@@ -419,6 +520,8 @@ fn convert(
         max,
         window: ((min + max) * 0.5, (max - min).max(1.0)),
         inverted,
+        spacing: None,
+        position: None,
     };
 
     if l.samples == 1 && l.photometric != "PALETTE COLOR" {
@@ -629,10 +732,16 @@ fn downsample(frame: Frame, max_dim: u32) -> Frame {
             Pixels::Rgba(out)
         }
     };
+    let f = factor as f32;
     Frame {
         width: w,
         height: h,
         pixels,
+        spacing: frame.spacing.map(|s| Spacing {
+            row: s.row * f,
+            col: s.col * f,
+            ..s
+        }),
         ..frame
     }
 }

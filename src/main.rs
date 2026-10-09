@@ -3,12 +3,15 @@
 
 mod app;
 mod check;
+mod colormap;
 mod decode;
 mod export;
 mod loader;
 mod mp4;
 mod render;
+mod render3d;
 mod scan;
+mod volume;
 
 use std::path::PathBuf;
 use std::sync::Arc;

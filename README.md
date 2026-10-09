@@ -19,6 +19,10 @@ you scrub through each series or cine loop.
 - Reads uncompressed, RLE, JPEG baseline and lossless, JPEG 2000 and deflated
   files, in greyscale, RGB, YBR and palette colour.
 - Saves any series or loop as an MP4 video, drawn as you see it on screen.
+- Shows millimetre rulers when the file gives a pixel size.
+- Colours greyscale images with hot-iron or rainbow maps.
+- Turns a series into a 3D stack of slices, with dark parts see-through, or
+  a maximum intensity projection.
 
 ## Get it
 
@@ -66,11 +70,66 @@ quick_dicom image.dcm       # open the file's folder and select that image
 | Reset the view          | Double-click                            | R                        |
 | Open a folder           |                                         | Ctrl+O (Cmd+O on macOS)  |
 | Save the series as MP4  | 💾 Save MP4… button                     | Ctrl+S (Cmd+S on macOS)  |
+| Change the colour map   | Colour menu in the toolbar              | C                        |
+| Show or hide rulers     | Rulers button                           | M                        |
+| Switch 3D on or off     | 3D button                               | D                        |
 
 The CT presets are 1 soft tissue, 2 lung, 3 bone, 4 brain and 5 liver.
 
 The corners of the image show the patient, study, series, frame number, image
-size, window, zoom and the value under the pointer.
+size, pixel size, window, zoom and the value under the pointer.
+
+### Rulers
+
+Rulers along the bottom and right edges show millimetres at the current zoom.
+They appear when the file gives a pixel size: Pixel Spacing for CT, MR and
+most other images, the calibrated region for ultrasound, or Imager Pixel
+Spacing for radiographs. That last is measured at the detector, where the
+X-ray beam has spread, so anatomy measures a few per cent larger than it is;
+the ruler says "at detector" when this is so.
+
+### Colour maps
+
+Colour maps replace grey with colour, after the window has been applied, so
+small differences in brightness become differences in hue:
+
+- **Hot iron** runs black, red, yellow, white. Nuclear medicine and PET use
+  it to show where a tracer has gathered.
+- **Rainbow** runs black, purple, blue, green, yellow, red, white. It is used
+  for nuclear medicine, perfusion and other parametric maps.
+
+Colour images, such as ultrasound Doppler, keep their own colours.
+
+### 3D
+
+![The 3D view of a vessel phantom, maximum intensity, hot iron](docs/3d.png)
+
+**3D** (or D) turns the series into a stack of its slices. The current slice
+tilts back and the others fan out behind it, spaced as the scanner recorded
+them. Dark parts are see-through and bright parts solid, so the window
+decides what you see: the bone window (3) shows the skeleton, the lung window
+(2) the lungs.
+
+| To                      | Mouse                                   |
+|-------------------------|-----------------------------------------|
+| Turn the stack          | Left-drag                               |
+| Change window and level | Ctrl+drag (Cmd+drag on macOS)           |
+| Pan                     | Right-drag, middle-drag or Shift+drag   |
+| Zoom                    | Wheel, or pinch on a trackpad           |
+| Reset the angle         | Double-click                            |
+
+The bottom bar holds the 3D settings:
+
+- **Blend** or **MIP**. MIP, maximum intensity projection, shows the
+  brightest value along each line of sight. It is the usual way to show
+  contrast-filled vessels in CT and MR angiography, and hot spots in PET.
+- **Opacity** sets how quickly bright parts block the view.
+- **Depth** stretches or squashes the gap between slices. Without slice
+  positions in the files, as in a cine loop, the stack is made half as deep
+  as it is wide.
+
+Series of more than 256 slices use every second (or third…) slice, and
+slices wider than 512 pixels are averaged down, so the stack fits on the GPU.
 
 ### Save a video
 
@@ -80,7 +139,9 @@ in browsers, PowerPoint, Keynote, QuickTime and VLC. The video:
 - runs through every frame, at the rate in the fps box;
 - uses the current window, level, inversion and smoothing, but not the zoom
   or pan, so it always shows the whole image;
-- leaves out the overlay text, so no patient details end up in the file;
+- uses the current colour map;
+- leaves out the overlay text and rulers, so no patient details end up in
+  the file;
 - scales small images up by a whole number, so the longer side is at least
   512 pixels, and large ones down, so it is at most 2048.
 
@@ -114,6 +175,8 @@ example `QUICK_DICOM_CACHE_MB=8000 quick_dicom /scans`.
   H.264 patent royalties only for the OpenH264 binaries it distributes itself,
   so that cover does not extend to these builds. This rarely matters for
   personal use; check before you distribute builds.
+- The 3D view is a stack of slices, not a reconstruction: seen almost edge-on,
+  the gaps between slices show. Videos always show the 2D slices.
 
 ## How it works
 
@@ -126,4 +189,8 @@ example `QUICK_DICOM_CACHE_MB=8000 quick_dicom /scans`.
 | `src/image.wgsl`   | Applies window, level and inversion, and filters the image: bilinear when zoomed in, several samples per pixel when zoomed out.                              |
 | `src/export.rs`    | Draws each frame with the current window into YUV, as the shader would, and encodes it with OpenH264 on a background thread.                                |
 | `src/mp4.rs`       | Writes the H.264 frames into an MP4 file, with the index before the data so playback can start before the file has loaded.                                   |
+| `src/volume.rs`    | Builds the 3D volume in the background: decodes every slice, keeps raw values as 16-bit floats, and works out the gap between slices from their positions.  |
+| `src/render3d.rs`  | Draws the slices far to near into an offscreen image, blending them or keeping the maximum, then puts that image on screen.                                  |
+| `src/volume.wgsl`  | The 3D shaders: places each slice, applies window and colour map, and makes dark parts clear and bright parts solid.                                        |
+| `src/colormap.rs`  | The colour maps, with twins in `src/common.wgsl` for the GPU.                                                                                               |
 | `src/app.rs`       | The window: series list, image view, keyboard and mouse handling, playback.                                                                                  |

@@ -37,7 +37,9 @@ impl ImageRenderer {
         let device = &rs.device;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("dicom image"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("image.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(include_str!("common.wgsl"), include_str!("image.wgsl")).into(),
+            ),
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("dicom image"),
