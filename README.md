@@ -127,9 +127,15 @@ The bottom bar holds the 3D settings:
 - **Depth** stretches or squashes the gap between slices. Without slice
   positions in the files, as in a cine loop, the stack is made half as deep
   as it is wide.
+- **Full detail**, on by default, keeps every slice at full resolution. The
+  corner shows the size of the volume and the GPU memory it takes: 500 CT
+  slices of 512 × 512 take about 250 MB. Turn it off on a GPU with little
+  memory, or when turning the stack is slow: the view then uses at most 256
+  slices (every second or third slice of a longer series) of at most 512
+  pixels across.
 
-Series of more than 256 slices use every second (or third…) slice, and
-slices wider than 512 pixels are averaged down, so the stack fits on the GPU.
+If the GPU cannot hold the volume, the 3D view closes and the status line
+says why, so you can turn off Full detail and try again.
 
 ### Save a video
 
@@ -190,7 +196,7 @@ example `QUICK_DICOM_CACHE_MB=8000 quick_dicom /scans`.
 | `src/export.rs`    | Draws each frame with the current window into YUV, as the shader would, and encodes it with OpenH264 on a background thread.                                |
 | `src/mp4.rs`       | Writes the H.264 frames into an MP4 file, with the index before the data so playback can start before the file has loaded.                                   |
 | `src/volume.rs`    | Builds the 3D volume in the background: decodes every slice, keeps raw values as 16-bit floats, and works out the gap between slices from their positions.  |
-| `src/render3d.rs`  | Draws the slices far to near into an offscreen image, blending them or keeping the maximum, then puts that image on screen.                                  |
+| `src/render3d.rs`  | Splits the volume across as many GPU texture arrays as it needs, draws the slices far to near into an offscreen image, then puts that image on screen.      |
 | `src/volume.wgsl`  | The 3D shaders: places each slice, applies window and colour map, and makes dark parts clear and bright parts solid.                                        |
 | `src/colormap.rs`  | The colour maps, with twins in `src/common.wgsl` for the GPU.                                                                                               |
 | `src/app.rs`       | The window: series list, image view, keyboard and mouse handling, playback.                                                                                  |

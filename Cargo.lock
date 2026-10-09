@@ -2767,6 +2767,7 @@ dependencies = [
  "dicom-pixeldata",
  "eframe",
  "openh264",
+ "pollster 0.4.0",
  "rayon",
  "rfd",
  "walkdir",

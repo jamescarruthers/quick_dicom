@@ -1,11 +1,12 @@
 //! Builds a 3D volume from a stack in the background, for the 3D view.
 //!
 //! Slices keep their raw values (as 16-bit floats), so window, level,
-//! inversion and colour maps still apply on the GPU. Large stacks are
-//! reduced to at most 512 pixels across and 256 slices.
+//! inversion and colour maps still apply on the GPU. At full detail every
+//! slice is kept at full resolution; the fast setting reduces large stacks
+//! to at most 512 pixels across and 256 slices.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Receiver;
 use rayon::prelude::*;
@@ -13,17 +14,22 @@ use rayon::prelude::*;
 use crate::decode::{Frame, Pixels, decode_frame};
 use crate::scan::{FrameRef, Stack, open_dicom};
 
-/// Largest side of a slice in the volume.
-const MAX_SIDE: u32 = 512;
+/// Largest side of a slice at the fast setting.
+const FAST_SIDE: u32 = 512;
+/// Most slices at the fast setting.
+const FAST_LAYERS: usize = 256;
 
 pub struct Volume {
     /// Which stack this came from.
     pub key: String,
+    /// Built at full detail rather than reduced.
+    pub full: bool,
     pub width: u32,
     pub height: u32,
     pub depth: u32,
-    /// Half-precision floats, slice after slice, row after row.
-    pub voxels: Vec<u16>,
+    /// Half-precision floats, slice after slice, row after row. The renderer
+    /// takes them when it uploads the volume, so they are not held twice.
+    voxels: Mutex<Vec<u16>>,
     /// Distance between slices in units of in-plane pixels; `None` when
     /// the files do not say (a cine loop, say).
     pub slice_gap: Option<f32>,
@@ -35,9 +41,31 @@ pub struct Volume {
     pub failed: usize,
 }
 
+impl Volume {
+    /// Size on the GPU.
+    pub fn bytes(&self) -> u64 {
+        self.width as u64 * self.height as u64 * self.depth as u64 * 2
+    }
+
+    /// Hand over the voxels, leaving none behind.
+    pub fn take_voxels(&self) -> Vec<u16> {
+        std::mem::take(&mut *self.voxels.lock().unwrap())
+    }
+}
+
+/// Every how many frames a slice is taken: all of them at full detail.
+fn stride_for(frames: usize, full: bool) -> usize {
+    if full {
+        1
+    } else {
+        frames.div_ceil(FAST_LAYERS).max(1)
+    }
+}
+
 /// A volume being built on a background thread. Dropping it cancels.
 pub struct VolumeJob {
     pub key: String,
+    pub full: bool,
     pub total: usize,
     done: Arc<AtomicUsize>,
     cancel: Arc<AtomicBool>,
@@ -51,12 +79,15 @@ impl Drop for VolumeJob {
 }
 
 impl VolumeJob {
-    pub fn start(stack: &Stack, max_layers: u32, ctx: eframe::egui::Context) -> Self {
-        let stride = stack
-            .frames
-            .len()
-            .div_ceil(max_layers.max(2) as usize)
-            .max(1);
+    /// `max_side` is the largest texture side the GPU takes; full detail
+    /// keeps slices as large as that.
+    pub fn start(stack: &Stack, full: bool, max_side: u32, ctx: eframe::egui::Context) -> Self {
+        let stride = stride_for(stack.frames.len(), full);
+        let side = if full {
+            max_side
+        } else {
+            FAST_SIDE.min(max_side)
+        };
         let frames: Vec<FrameRef> = stack.frames.iter().step_by(stride).cloned().collect();
         let total = frames.len();
         let done = Arc::new(AtomicUsize::new(0));
@@ -68,13 +99,14 @@ impl VolumeJob {
             .name("volume".into())
             .spawn(move || {
                 let progress = || ctx.request_repaint();
-                let out = build(k, &frames, stride, &d, &c, &progress);
+                let out = build(k, full, &frames, stride, side, &d, &c, &progress);
                 let _ = tx.send(out);
                 ctx.request_repaint();
             })
             .expect("failed to spawn volume thread");
         VolumeJob {
             key,
+            full,
             total,
             done,
             cancel,
@@ -91,10 +123,13 @@ impl VolumeJob {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build(
     key: String,
+    full: bool,
     frames: &[FrameRef],
     stride: usize,
+    max_side: u32,
     done: &AtomicUsize,
     cancel: &AtomicBool,
     progress: &(dyn Fn() + Sync),
@@ -111,7 +146,7 @@ fn build(
     };
 
     let head = load(first)?;
-    let factor = head.width.max(head.height).div_ceil(MAX_SIDE).max(1);
+    let factor = head.width.max(head.height).div_ceil(max_side.max(1)).max(1);
     let (width, height) = (head.width / factor, head.height / factor);
     let layer_len = (width * height) as usize;
     let mut voxels = vec![0u16; layer_len * frames.len()];
@@ -169,10 +204,11 @@ fn build(
 
     Ok(Volume {
         key,
+        full,
         width,
         height,
         depth: frames.len() as u32,
-        voxels,
+        voxels: Mutex::new(voxels),
         slice_gap,
         stride,
         window: head.window,
@@ -249,6 +285,14 @@ mod tests {
         assert_eq!(f16_bits(65504.0), 0x7BFF);
         assert_eq!(f16_bits(1e9), 0x7BFF);
         assert_eq!(f16_bits(5.960_464_5e-8), 0x0001);
+    }
+
+    #[test]
+    fn full_detail_keeps_every_slice() {
+        assert_eq!(stride_for(1000, true), 1);
+        assert_eq!(stride_for(1000, false), 4);
+        assert_eq!(stride_for(256, false), 1);
+        assert_eq!(stride_for(257, false), 2);
     }
 
     #[test]
