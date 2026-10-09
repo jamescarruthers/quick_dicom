@@ -3,8 +3,11 @@
 //! `prepare` draws every slice into an offscreen image (16-bit float where
 //! the GPU can blend it, so faint slices still add up); `paint` copies that
 //! image onto the screen, applying the colour map for maximum intensity.
+//!
+//! A GPU holds only so many slices in one texture array (often 256), so a
+//! volume is split across as many arrays as it needs.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use eframe::egui_wgpu::{self, wgpu};
 
@@ -21,7 +24,8 @@ pub struct VolumeUniforms {
     pub look: [f32; 4],
 }
 
-struct VolumeTexture {
+/// One texture array holding a run of consecutive slices.
+struct Chunk {
     bind_group: wgpu::BindGroup,
     layers: u32,
 }
@@ -41,7 +45,7 @@ pub struct VolumeRenderer {
     uniforms: wgpu::Buffer,
     sampler: wgpu::Sampler,
     format: wgpu::TextureFormat,
-    volume: Option<VolumeTexture>,
+    volume: Option<Vec<Chunk>>,
     /// The volume on the GPU, to tell when a new one needs uploading.
     uploaded: Option<Arc<Volume>>,
     offscreen: Option<Offscreen>,
@@ -100,6 +104,17 @@ impl VolumeRenderer {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                // Which slices this chunk holds.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
                     count: None,
                 },
             ],
@@ -233,64 +248,125 @@ impl VolumeRenderer {
             });
     }
 
-    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, volume: &Arc<Volume>) {
-        let size = wgpu::Extent3d {
-            width: volume.width,
-            height: volume.height,
-            depth_or_array_layers: volume.depth,
-        };
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("dicom volume"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            bytemuck::cast_slice(&volume.voxels),
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(volume.width * 2),
-                rows_per_image: Some(volume.height),
-            },
-            size,
-        );
-        let view = texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("volume slices"),
-            layout: &self.slice_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.uniforms.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
-        self.volume = Some(VolumeTexture {
-            bind_group,
-            layers: volume.depth,
-        });
+    /// Put the volume on the GPU, one slice at a time, in as many texture
+    /// arrays as it needs. Fails, rather than crashing, when the GPU runs
+    /// out of memory.
+    fn upload(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        volume: &Arc<Volume>,
+    ) -> Result<(), String> {
+        // Free the previous volume before allocating the next.
+        self.volume = None;
         self.uploaded = Some(volume.clone());
+        let voxels = volume.take_voxels();
+        let (w, h) = (volume.width, volume.height);
+        let layer_len = (w * h) as usize;
+        if voxels.len() < layer_len * volume.depth as usize {
+            return Err("the volume has no data".into());
+        }
+        let per_chunk = device.limits().max_texture_array_layers.max(1);
+
+        let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut chunks = Vec::new();
+        let mut first = 0;
+        while first < volume.depth {
+            let layers = per_chunk.min(volume.depth - first);
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("dicom volume"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: layers,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            for l in 0..layers {
+                let start = (first + l) as usize * layer_len;
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x: 0, y: 0, z: l },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    bytemuck::cast_slice(&voxels[start..start + layer_len]),
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(w * 2),
+                        rows_per_image: Some(h),
+                    },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
+            let info = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("volume chunk"),
+                size: 16,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let range = [first as f32, layers as f32, 0.0, 0.0];
+            queue.write_buffer(&info, 0, bytemuck::cast_slice(&range));
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("volume slices"),
+                layout: &self.slice_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.uniforms.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: info.as_entire_binding(),
+                    },
+                ],
+            });
+            chunks.push(Chunk { bind_group, layers });
+            first += layers;
+        }
+        // Error scopes pop in the reverse order they were pushed.
+        let invalid = pollster::block_on(validation.pop());
+        let out_of_memory = pollster::block_on(memory.pop());
+        if out_of_memory.is_some() {
+            return Err(format!(
+                "the GPU does not have {} MB free for this volume",
+                volume.bytes() >> 20
+            ));
+        }
+        if let Some(e) = invalid {
+            // wgpu's message spans several lines; the last says what was wrong.
+            let text = e.to_string();
+            let cause = text.lines().map(str::trim).rfind(|l| !l.is_empty());
+            return Err(format!(
+                "the GPU refused the volume ({})",
+                cause.unwrap_or("validation error")
+            ));
+        }
+        self.volume = Some(chunks);
+        Ok(())
     }
 
     fn ensure_offscreen(&mut self, device: &wgpu::Device, size: (u32, u32)) {
@@ -341,6 +417,8 @@ pub struct VolumeCallback {
     /// Size of the view in physical pixels.
     pub size_px: (u32, u32),
     pub maximum_intensity: bool,
+    /// Where to report a volume the GPU could not take.
+    pub error: Arc<Mutex<Option<String>>>,
 }
 
 impl egui_wgpu::CallbackTrait for VolumeCallback {
@@ -358,18 +436,20 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         if self.size_px.0 == 0 || self.size_px.1 == 0 {
             return Vec::new();
         }
+        // A failed upload is not retried: `uploaded` already names this volume.
         if r.uploaded
             .as_ref()
             .is_none_or(|v| !Arc::ptr_eq(v, &self.volume))
+            && let Err(e) = r.upload(device, queue, &self.volume)
         {
-            r.upload(device, queue, &self.volume);
+            *self.error.lock().unwrap() = Some(e);
         }
         r.ensure_offscreen(device, self.size_px);
         let mut u = self.uniforms;
         u.look[2] = if r.srgb_target { 1.0 } else { 0.0 };
         queue.write_buffer(&r.uniforms, 0, bytemuck::bytes_of(&u));
 
-        let (Some(volume), Some(offscreen)) = (&r.volume, &r.offscreen) else {
+        let (Some(chunks), Some(offscreen)) = (&r.volume, &r.offscreen) else {
             return Vec::new();
         };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -393,8 +473,17 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         } else {
             &r.blend
         });
-        pass.set_bind_group(0, &volume.bind_group, &[]);
-        pass.draw(0..4, 0..volume.layers);
+        // Far to near: when the last slice is farthest, start with the last chunk.
+        let reverse = self.uniforms.slices[3] > 0.5;
+        let mut draw = |chunk: &Chunk| {
+            pass.set_bind_group(0, &chunk.bind_group, &[]);
+            pass.draw(0..4, 0..chunk.layers);
+        };
+        if reverse {
+            chunks.iter().rev().for_each(&mut draw);
+        } else {
+            chunks.iter().for_each(&mut draw);
+        }
         Vec::new()
     }
 

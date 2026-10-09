@@ -22,16 +22,28 @@ struct Uniforms {
 @group(0) @binding(1) var volume: texture_2d_array<f32>;
 @group(0) @binding(2) var volume_sampler: sampler;
 
+// The volume may span several texture arrays; this one holds `count`
+// slices starting at slice `first`.
+struct Chunk {
+    first: f32,
+    count: f32,
+    unused: vec2<f32>,
+};
+@group(0) @binding(4) var<uniform> chunk: Chunk;
+
 struct SliceOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
+    // The slice's place in the whole volume, and in this chunk's array.
     @location(1) @interpolate(flat) layer: i32,
+    @location(2) @interpolate(flat) local: i32,
 };
 
 @vertex
 fn vs_slice(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> SliceOut {
-    let layers = u32(u.dims.z);
-    let layer = select(i, layers - 1u - i, u.slices.w > 0.5);
+    let count = u32(chunk.count);
+    let local = select(i, count - 1u - i, u.slices.w > 0.5);
+    let layer = u32(chunk.first) + local;
     let c = vec2<f32>(f32(v & 1u), f32((v >> 1u) & 1u));
     let p = vec4<f32>(
         (c.x - 0.5) * u.dims.x,
@@ -43,12 +55,13 @@ fn vs_slice(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> S
     out.pos = vec4<f32>(dot(u.mx, p), dot(u.my, p), 0.5, 1.0);
     out.uv = c;
     out.layer = i32(layer);
+    out.local = i32(local);
     return out;
 }
 
 @fragment
 fn fs_slice(in: SliceOut) -> @location(0) vec4<f32> {
-    let v = textureSample(volume, volume_sampler, in.uv, in.layer).r;
+    let v = textureSample(volume, volume_sampler, in.uv, in.local).r;
     let width = max(u.wl.y, 1e-6);
     var g = clamp((v - (u.wl.x - 0.5 * width)) / width, 0.0, 1.0);
     let current = in.layer == i32(u.dims.w);

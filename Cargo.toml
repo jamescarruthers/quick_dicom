@@ -20,6 +20,7 @@ eframe = { version = "0.36.2", default-features = false, features = [
     "x11",
 ] }
 openh264 = "0.9.8"
+pollster = "0.4"
 rayon = "1.12.0"
 rfd = "0.17.2"
 walkdir = "2.5.0"

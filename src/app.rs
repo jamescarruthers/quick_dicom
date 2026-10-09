@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use eframe::egui::{
@@ -81,6 +81,9 @@ struct ThreeD {
     /// How quickly bright voxels become opaque, summed over the stack.
     density: f32,
     combine: Combine,
+    /// Every slice at full resolution, rather than at most 256 slices of
+    /// at most 512 pixels.
+    full_detail: bool,
 }
 
 impl Default for ThreeD {
@@ -94,6 +97,7 @@ impl Default for ThreeD {
             depth: 1.0,
             density: 8.0,
             combine: Combine::Blend,
+            full_detail: true,
         }
     }
 }
@@ -128,8 +132,10 @@ pub struct ViewerApp {
     three_d: ThreeD,
     volume: Option<Arc<Volume>>,
     volume_job: Option<VolumeJob>,
-    /// Most slices the GPU can hold in one texture array.
-    max_layers: u32,
+    /// Largest texture side the GPU takes.
+    max_side: u32,
+    /// Set by the 3D renderer when the GPU cannot take a volume.
+    gpu_error: Arc<Mutex<Option<String>>>,
 }
 
 impl ViewerApp {
@@ -142,7 +148,6 @@ impl ViewerApp {
         ImageRenderer::install(rs);
         VolumeRenderer::install(rs);
         let max_dim = rs.device.limits().max_texture_dimension_2d;
-        let max_layers = rs.device.limits().max_texture_array_layers.min(256);
 
         let budget_mb = std::env::var("QUICK_DICOM_CACHE_MB")
             .ok()
@@ -175,7 +180,8 @@ impl ViewerApp {
             three_d: ThreeD::default(),
             volume: None,
             volume_job: None,
-            max_layers,
+            max_side: max_dim,
+            gpu_error: Arc::default(),
         };
         if let Some(p) = path {
             app.open(p, &cc.egui_ctx);
@@ -433,12 +439,21 @@ impl ViewerApp {
                 }
             }
         }
+        if let Some(e) = self.gpu_error.lock().unwrap().take() {
+            self.status = if self.three_d.full_detail {
+                format!("Could not show the 3D view: {e}. Try turning off Full detail.")
+            } else {
+                format!("Could not show the 3D view: {e}")
+            };
+            self.three_d.on = false;
+            self.volume = None;
+        }
 
         let key = self.stack().map(|s| s.key.clone());
         let ready = self
             .volume
             .as_ref()
-            .is_some_and(|v| Some(&v.key) == key.as_ref());
+            .is_some_and(|v| Some(&v.key) == key.as_ref() && v.full == self.three_d.full_detail);
         if !ready {
             // A volume of another stack must not be drawn for this one.
             self.three_d.t = 0.0;
@@ -451,12 +466,16 @@ impl ViewerApp {
             self.three_d.on = false;
         }
         if self.three_d.on && !ready {
-            let building = self
-                .volume_job
-                .as_ref()
-                .is_some_and(|j| Some(&j.key) == key.as_ref());
+            let building = self.volume_job.as_ref().is_some_and(|j| {
+                Some(&j.key) == key.as_ref() && j.full == self.three_d.full_detail
+            });
             if !building && let Some(stack) = self.stack().cloned() {
-                self.volume_job = Some(VolumeJob::start(&stack, self.max_layers, ctx.clone()));
+                self.volume_job = Some(VolumeJob::start(
+                    &stack,
+                    self.three_d.full_detail,
+                    self.max_side,
+                    ctx.clone(),
+                ));
             }
         }
         if !self.three_d.on {
@@ -684,7 +703,8 @@ impl ViewerApp {
                 );
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(&self.status);
+                // Long messages are cut to fit; egui shows the whole text on hover.
+                ui.add(egui::Label::new(&self.status).truncate());
                 if self.scanning {
                     ui.spinner();
                 }
@@ -775,6 +795,13 @@ impl ViewerApp {
                         .prefix("Depth ×"),
                 )
                 .on_hover_text("Stretch or squash the gap between slices");
+                let mb = (stack.max_rows as u64 * stack.max_cols as u64 * n as u64 * 2) >> 20;
+                ui.toggle_value(&mut self.three_d.full_detail, "Full detail")
+                    .on_hover_text(format!(
+                        "On: every slice at full resolution, about {mb} MB of GPU memory \
+                         for this series. Off: at most 256 slices of at most 512 pixels, \
+                         which is lighter on small GPUs."
+                    ));
                 ui.separator();
             }
             let digits = n.to_string().len();
@@ -1202,6 +1229,7 @@ impl ViewerApp {
                 uniforms,
                 size_px,
                 maximum_intensity: maximum,
+                error: self.gpu_error.clone(),
             },
         ));
 
@@ -1209,6 +1237,12 @@ impl ViewerApp {
         if volume.stride > 1 {
             info.push_str(&format!(" (every {})", ordinal(volume.stride)));
         }
+        info.push_str(&format!(
+            "\n{} × {} · {} MB",
+            volume.width,
+            volume.height,
+            volume.bytes() >> 20
+        ));
         info.push_str(&format!(
             "\n{}\nW {:.0}  L {:.0}",
             if maximum {
