@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -9,6 +9,7 @@ use eframe::egui::{
 use eframe::egui_wgpu;
 
 use crate::decode::Frame;
+use crate::export::{self, Export};
 use crate::loader::{Loader, Slot};
 use crate::render::{ImageCallback, ImageRenderer, Uniforms};
 use crate::scan::{FrameRef, Library, ScanEvent, Scanner, Stack};
@@ -68,6 +69,10 @@ pub struct ViewerApp {
     requested: Option<(String, usize, usize)>,
     filter: String,
     scroll_to_selected: bool,
+    /// A video being saved, if any.
+    export: Option<Export>,
+    /// Where the last video went, to offer the same folder next time.
+    export_dir: Option<PathBuf>,
 }
 
 impl ViewerApp {
@@ -106,6 +111,8 @@ impl ViewerApp {
             requested: None,
             filter: String::new(),
             scroll_to_selected: false,
+            export: None,
+            export_dir: None,
         };
         if let Some(p) = path {
             app.open(p, &cc.egui_ctx);
@@ -146,6 +153,69 @@ impl ViewerApp {
         if let Some(dir) = dialog.pick_folder() {
             self.open(dir, ctx);
         }
+    }
+
+    /// Ask where to save, then write the current stack as an MP4 in the
+    /// background with the current window, inversion and frame rate.
+    fn save_video(&mut self, ctx: &egui::Context) {
+        let Some(stack) = self.stack().cloned() else {
+            return;
+        };
+        if self.export.is_some() || stack.frames.len() < 2 {
+            return;
+        }
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save the series as a video")
+            .add_filter("MP4 video", &["mp4"])
+            .set_file_name(format!("{}.mp4", file_stem(&stack.label)));
+        if let Some(dir) = &self.export_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(mut path) = dialog.save_file() else {
+            return;
+        };
+        if !path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
+        {
+            path.as_mut_os_string().push(".mp4");
+        }
+        self.export_dir = path.parent().map(Path::to_path_buf);
+        let settings = export::Settings {
+            frames: stack.frames.clone(),
+            fps: self.fps,
+            window: self.view.window,
+            invert: self.view.invert,
+            smooth: self.view.smooth,
+        };
+        self.export = Some(Export::start(settings, path, ctx.clone()));
+    }
+
+    fn poll_export(&mut self) {
+        let Some(result) = self.export.as_ref().and_then(Export::poll) else {
+            return;
+        };
+        let export = self.export.take().expect("polled an export");
+        let name = export
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.status = match result {
+            Ok(s) => {
+                let mut msg = format!(
+                    "Saved {name}: {} frames, {:.1} MB",
+                    s.frames,
+                    s.bytes as f64 / 1e6
+                );
+                if s.failed > 0 {
+                    msg.push_str(&format!(", {} unreadable frames left black", s.failed));
+                }
+                msg
+            }
+            Err(e) if e == "cancelled" => "Video not saved".into(),
+            Err(e) => format!("Could not save the video: {e}"),
+        };
     }
 
     fn stack(&self) -> Option<&Arc<Stack>> {
@@ -274,6 +344,9 @@ impl ViewerApp {
     fn handle_keys(&mut self, ctx: &egui::Context) {
         if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
             self.pick_folder(ctx);
+        }
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::S)) {
+            self.save_video(ctx);
         }
         if ctx.egui_wants_keyboard_input() {
             return;
@@ -474,6 +547,31 @@ impl ViewerApp {
                     .max_decimals(1)
                     .suffix(" fps"),
             );
+            match &self.export {
+                Some(e) => {
+                    let (done, total) = (e.done(), e.total.max(1));
+                    ui.add(
+                        egui::ProgressBar::new(done as f32 / total as f32)
+                            .desired_width(150.0)
+                            .text(format!("Saving {done} / {total}")),
+                    );
+                    if ui.button("Cancel").clicked() {
+                        e.cancel();
+                    }
+                }
+                None => {
+                    if ui
+                        .add_enabled(n > 1, egui::Button::new("💾 Save MP4…"))
+                        .on_hover_text(
+                            "Ctrl+S: save this series as a video, \
+                             with the current window and frame rate",
+                        )
+                        .clicked()
+                    {
+                        self.save_video(&ui.ctx().clone());
+                    }
+                }
+            }
             let digits = n.to_string().len();
             ui.monospace(format!("{:>digits$} / {n}", self.index + 1));
 
@@ -824,6 +922,7 @@ impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_scan();
+        self.poll_export();
         if let Some(path) = ctx.input(|i| {
             i.raw.dropped_files.iter().find_map(|f| {
                 let p = f.path();
@@ -851,5 +950,40 @@ impl eframe::App for ViewerApp {
 
         // Requests may have changed while drawing (slider, wheel, clicks).
         self.update_requests();
+    }
+}
+
+/// A file name from a stack label: "#3 XA Coronary run  [30 fr]" becomes
+/// "3_XA_Coronary_run".
+fn file_stem(label: &str) -> String {
+    let base = label.split('[').next().unwrap_or(label);
+    let mut out = String::new();
+    for c in base.chars() {
+        if c.is_alphanumeric() || c == '-' {
+            out.push(c);
+        } else if !out.is_empty() && !out.ends_with('_') {
+            out.push('_');
+        }
+    }
+    let out = out.trim_end_matches('_');
+    if out.is_empty() {
+        "series".into()
+    } else {
+        out.into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::file_stem;
+
+    #[test]
+    fn file_names_come_from_labels() {
+        assert_eq!(
+            file_stem("#3 XA Coronary run  [30 fr]"),
+            "3_XA_Coronary_run"
+        );
+        assert_eq!(file_stem("#2 CT Axial 3mm · 4  [80]"), "2_CT_Axial_3mm_4");
+        assert_eq!(file_stem("[1]"), "series");
     }
 }

@@ -4,7 +4,9 @@
 mod app;
 mod check;
 mod decode;
+mod export;
 mod loader;
+mod mp4;
 mod render;
 mod scan;
 
