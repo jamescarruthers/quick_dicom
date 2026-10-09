@@ -11,6 +11,7 @@ mod mp4;
 mod render;
 mod render3d;
 mod scan;
+mod sharpen;
 mod volume;
 
 use std::path::PathBuf;

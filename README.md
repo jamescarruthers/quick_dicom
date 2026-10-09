@@ -21,6 +21,7 @@ you scrub through each series or cine loop.
 - Saves any series or loop as an MP4 video, drawn as you see it on screen.
 - Shows millimetre rulers when the file gives a pixel size.
 - Colours greyscale images with hot-iron or rainbow maps.
+- Sharpens edges and fine detail while leaving noise mostly alone.
 - Turns a series into a 3D stack of slices, with dark parts see-through, or
   a maximum intensity projection.
 
@@ -67,6 +68,7 @@ quick_dicom image.dcm       # open the file's folder and select that image
 | Zoom                    | Ctrl+wheel, or pinch on a trackpad      | F fits the image         |
 | Invert                  |                                         | I                        |
 | Smooth or sharp pixels  |                                         | S                        |
+| Sharpen edges           | Sharpen menu in the toolbar             | E                        |
 | Reset the view          | Double-click                            | R                        |
 | Open a folder           |                                         | Ctrl+O (Cmd+O on macOS)  |
 | Save the series as MP4  | 💾 Save MP4… button                     | Ctrl+S (Cmd+S on macOS)  |
@@ -99,6 +101,35 @@ small differences in brightness become differences in hue:
   for nuclear medicine, perfusion and other parametric maps.
 
 Colour images, such as ultrasound Doppler, keep their own colours.
+
+### Sharpen
+
+**Sharpen** (or E) makes edges and small details stand out. It has three
+strengths: low, medium and high.
+
+It uses unsharp masking, the method behind the edge enhancement in
+radiography systems and photo editors. The viewer blurs the image, subtracts
+the blur from the original to leave the fine detail, and adds more of that
+detail back. The GPU does this once for each new frame, not on every
+redraw.
+
+Two things set it apart from a plain sharpening filter:
+
+- It leaves noise mostly alone. The viewer measures the noise in each image.
+  Detail well above that level gets the full boost; detail at or below it
+  gets almost none. Edges sharpen while the grain of a CT or MR image grows
+  only a little: by about a quarter at medium, on a test image.
+- It works at the scale of the screen. The blur is one screen pixel wide,
+  so a large radiograph shown small sharpens as clearly as a small CT slice
+  shown large.
+
+Colour images are sharpened in brightness only, so colours keep their hue.
+
+Sharpening draws a thin dark or bright line beside strong edges, such as
+inside the skull on CT. These lines are not anatomy. The value shown under
+the pointer is always the original, unsharpened value.
+
+Videos are sharpened as the screen is; the 3D view is not.
 
 ### 3D
 
@@ -143,8 +174,8 @@ says why, so you can turn off Full detail and try again.
 in browsers, PowerPoint, Keynote, QuickTime and VLC. The video:
 
 - runs through every frame, at the rate in the fps box;
-- uses the current window, level, inversion and smoothing, but not the zoom
-  or pan, so it always shows the whole image;
+- uses the current window, level, inversion, smoothing and sharpening, but
+  not the zoom or pan, so it always shows the whole image;
 - uses the current colour map;
 - leaves out the overlay text and rulers, so no patient details end up in
   the file;
@@ -199,4 +230,6 @@ example `QUICK_DICOM_CACHE_MB=8000 quick_dicom /scans`.
 | `src/render3d.rs`  | Splits the volume across as many GPU texture arrays as it needs, draws the slices far to near into an offscreen image, then puts that image on screen.      |
 | `src/volume.wgsl`  | The 3D shaders: places each slice, applies window and colour map, and makes dark parts clear and bright parts solid.                                        |
 | `src/colormap.rs`  | The colour maps, with twins in `src/common.wgsl` for the GPU.                                                                                               |
+| `src/sharpen.rs`   | Sharpening: measures each image's noise, runs the two GPU passes, and does the same on the CPU for videos.                                                  |
+| `src/sharpen.wgsl` | The sharpening shaders: a Gaussian blur across and then down, then the image plus the detail the blur removed, with detail near the noise level held back. |
 | `src/app.rs`       | The window: series list, image view, keyboard and mouse handling, playback.                                                                                  |

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use eframe::egui_wgpu::{self, wgpu};
 
 use crate::decode::{Frame, Pixels};
+use crate::sharpen::{self, GpuSharpen, Target};
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -18,8 +19,15 @@ pub struct Uniforms {
 struct Texture {
     bind_group: wgpu::BindGroup,
     texture: wgpu::Texture,
+    view: wgpu::TextureView,
     size: (u32, u32),
     format: wgpu::TextureFormat,
+    /// Textures for the sharpened image and the bind group that shows it,
+    /// made the first time sharpening is asked for.
+    sharp: Option<(Target, wgpu::BindGroup)>,
+    /// Amount and sigma that `sharp` was made with, for the frame now
+    /// uploaded.
+    sharp_made: Option<(f32, f32)>,
 }
 
 /// GPU state, stored in egui's callback resources.
@@ -30,10 +38,17 @@ pub struct ImageRenderer {
     texture: Option<Texture>,
     uploaded: u64,
     srgb_target: bool,
+    /// `None` when the GPU cannot sharpen.
+    sharpener: Option<GpuSharpen>,
+    /// Noise threshold of the uploaded frame, worked out when first needed.
+    threshold: Option<f32>,
+    /// Whether this frame's paint shows the sharpened image.
+    show_sharp: bool,
 }
 
 impl ImageRenderer {
-    pub fn install(rs: &egui_wgpu::RenderState) {
+    /// Returns whether the GPU can sharpen.
+    pub fn install(rs: &egui_wgpu::RenderState) -> bool {
         let device = &rs.device;
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("dicom image"),
@@ -106,6 +121,8 @@ impl ImageRenderer {
             mapped_at_creation: false,
         });
 
+        let sharpener = GpuSharpen::new(device, &rs.adapter);
+        let can_sharpen = sharpener.is_some();
         rs.renderer
             .write()
             .callback_resources
@@ -116,7 +133,11 @@ impl ImageRenderer {
                 texture: None,
                 uploaded: 0,
                 srgb_target: rs.target_format.is_srgb(),
+                sharpener,
+                threshold: None,
+                show_sharp: false,
             });
+        can_sharpen
     }
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &Frame) {
@@ -145,28 +166,19 @@ impl ImageRenderer {
                 view_formats: &[],
             });
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("dicom image"),
-                layout: &self.layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.uniforms.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                ],
-            });
             self.texture = Some(Texture {
-                bind_group,
+                bind_group: bind_group(device, &self.layout, &self.uniforms, &view),
                 texture,
+                view,
                 size,
                 format,
+                sharp: None,
+                sharp_made: None,
             });
         }
-        let t = self.texture.as_ref().unwrap();
+        let t = self.texture.as_mut().unwrap();
+        t.sharp_made = None;
+        self.threshold = None;
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &t.texture,
@@ -188,12 +200,67 @@ impl ImageRenderer {
         );
         self.uploaded = frame.id;
     }
+
+    /// Fill the sharpened texture for the uploaded frame, unless it already
+    /// holds this amount and sigma. Returns whether there is one to show.
+    fn sharpen(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        frame: &Frame,
+        (amount, sigma): (f32, f32),
+    ) -> bool {
+        let (Some(gpu), Some(t)) = (&self.sharpener, &mut self.texture) else {
+            return false;
+        };
+        if t.sharp_made == Some((amount, sigma)) {
+            return true;
+        }
+        let (target, _) = t.sharp.get_or_insert_with(|| {
+            let gray = t.format == wgpu::TextureFormat::R32Float;
+            let target = gpu.target(device, &t.view, t.size, gray);
+            let show = bind_group(device, &self.layout, &self.uniforms, &target.out);
+            (target, show)
+        });
+        let threshold = *self
+            .threshold
+            .get_or_insert_with(|| sharpen::threshold(frame));
+        gpu.run(queue, encoder, target, amount, sigma, threshold);
+        t.sharp_made = Some((amount, sigma));
+        true
+    }
+}
+
+/// A bind group that shows `view` with the image pipeline.
+fn bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniforms: &wgpu::Buffer,
+    view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("dicom image"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(view),
+            },
+        ],
+    })
 }
 
 /// One frame's draw request. The texture is uploaded only when the frame changes.
 pub struct ImageCallback {
     pub frame: Arc<Frame>,
     pub uniforms: Uniforms,
+    /// Amount and blur sigma in image pixels, when sharpening.
+    pub sharpen: Option<(f32, f32)>,
 }
 
 impl egui_wgpu::CallbackTrait for ImageCallback {
@@ -202,7 +269,7 @@ impl egui_wgpu::CallbackTrait for ImageCallback {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         _screen: &egui_wgpu::ScreenDescriptor,
-        _encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let Some(r) = resources.get_mut::<ImageRenderer>() else {
@@ -211,6 +278,17 @@ impl egui_wgpu::CallbackTrait for ImageCallback {
         if r.uploaded != self.frame.id {
             r.upload(device, queue, &self.frame);
         }
+        r.show_sharp = match self.sharpen {
+            Some(s) => r.sharpen(device, queue, encoder, &self.frame, s),
+            None => {
+                // Give back the GPU memory: two more copies of the image.
+                if let Some(t) = &mut r.texture {
+                    t.sharp = None;
+                    t.sharp_made = None;
+                }
+                false
+            }
+        };
         let mut u = self.uniforms;
         u.mode[2] = if r.srgb_target { 1.0 } else { 0.0 };
         queue.write_buffer(&r.uniforms, 0, bytemuck::bytes_of(&u));
@@ -229,8 +307,12 @@ impl egui_wgpu::CallbackTrait for ImageCallback {
         let Some(t) = &r.texture else {
             return;
         };
+        let group = match &t.sharp {
+            Some((_, show)) if r.show_sharp => show,
+            _ => &t.bind_group,
+        };
         pass.set_pipeline(&r.pipeline);
-        pass.set_bind_group(0, &t.bind_group, &[]);
+        pass.set_bind_group(0, group, &[]);
         pass.draw(0..4, 0..1);
     }
 }

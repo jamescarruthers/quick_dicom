@@ -15,6 +15,7 @@ use crate::loader::{Loader, Slot};
 use crate::render::{ImageCallback, ImageRenderer, Uniforms};
 use crate::render3d::{VolumeCallback, VolumeRenderer, VolumeUniforms};
 use crate::scan::{FrameRef, Library, ScanEvent, Scanner, Stack};
+use crate::sharpen::{self, Sharpen};
 use crate::volume::{Volume, VolumeJob};
 
 /// Common CT windows as (name, centre, width).
@@ -35,6 +36,7 @@ struct View {
     window: Option<(f32, f32)>,
     invert: bool,
     smooth: bool,
+    sharpen: Sharpen,
     colormap: Colormap,
     /// Show millimetre rulers when the file gives a pixel size.
     rulers: bool,
@@ -48,6 +50,7 @@ impl Default for View {
             window: None,
             invert: false,
             smooth: true,
+            sharpen: Sharpen::Off,
             colormap: Colormap::Grey,
             rulers: true,
         }
@@ -134,6 +137,8 @@ pub struct ViewerApp {
     volume_job: Option<VolumeJob>,
     /// Largest texture side the GPU takes.
     max_side: u32,
+    /// The GPU can draw into the textures sharpening needs.
+    can_sharpen: bool,
     /// Set by the 3D renderer when the GPU cannot take a volume.
     gpu_error: Arc<Mutex<Option<String>>>,
 }
@@ -145,7 +150,7 @@ impl ViewerApp {
             .wgpu_render_state
             .as_ref()
             .expect("the wgpu renderer is required");
-        ImageRenderer::install(rs);
+        let can_sharpen = ImageRenderer::install(rs);
         VolumeRenderer::install(rs);
         let max_dim = rs.device.limits().max_texture_dimension_2d;
 
@@ -181,6 +186,7 @@ impl ViewerApp {
             volume: None,
             volume_job: None,
             max_side: max_dim,
+            can_sharpen,
             gpu_error: Arc::default(),
         };
         if let Some(p) = path {
@@ -256,6 +262,7 @@ impl ViewerApp {
             window: self.view.window,
             invert: self.view.invert,
             smooth: self.view.smooth,
+            sharpen: self.view.sharpen.amount(),
             colormap: self.view.colormap,
         };
         self.export = Some(Export::start(settings, path, ctx.clone()));
@@ -307,6 +314,7 @@ impl ViewerApp {
         };
         self.view = View {
             smooth: self.view.smooth,
+            sharpen: self.view.sharpen,
             colormap: self.view.colormap,
             rulers: self.view.rulers,
             ..View::default()
@@ -534,6 +542,7 @@ impl ViewerApp {
         let fit = pressed(Key::F);
         let invert = pressed(Key::I);
         let smooth = pressed(Key::S);
+        let sharpen = pressed(Key::E);
         let colours = pressed(Key::C);
         let rulers = pressed(Key::M);
         let three_d = pressed(Key::D);
@@ -562,6 +571,11 @@ impl ViewerApp {
         }
         if smooth % 2 == 1 {
             self.view.smooth = !self.view.smooth;
+        }
+        if self.can_sharpen {
+            for _ in 0..sharpen {
+                self.view.sharpen = self.view.sharpen.next();
+            }
         }
         for _ in 0..colours {
             self.view.colormap = self.view.colormap.next();
@@ -661,6 +675,20 @@ impl ViewerApp {
                 .on_hover_text("I");
             ui.toggle_value(&mut self.view.smooth, "Smooth")
                 .on_hover_text("S: bilinear filtering on or off");
+            ui.add_enabled_ui(self.can_sharpen, |ui| {
+                egui::ComboBox::from_id_salt("sharpen")
+                    .selected_text(format!("Sharpen: {}", self.view.sharpen.name()))
+                    .show_ui(ui, |ui| {
+                        for s in Sharpen::ALL {
+                            ui.selectable_value(&mut self.view.sharpen, s, s.name());
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "E: sharpen edges; detail at the level of the noise is left alone",
+                    )
+                    .on_disabled_hover_text("This GPU cannot sharpen");
+            });
             let is_ct = self.stack().is_some_and(|s| s.modality == "CT");
             ui.add_enabled_ui(is_ct, |ui| {
                 egui::ComboBox::from_id_salt("preset")
@@ -1037,6 +1065,10 @@ impl ViewerApp {
             ImageCallback {
                 frame: frame.clone(),
                 uniforms,
+                sharpen: (self.view.sharpen != Sharpen::Off).then(|| {
+                    let screen_scale = scale * ui.ctx().pixels_per_point();
+                    (self.view.sharpen.amount(), sharpen::sigma_for(screen_scale))
+                }),
             },
         ));
 

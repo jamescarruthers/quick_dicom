@@ -1,6 +1,6 @@
 //! Saves a stack as an H.264 MP4 video, drawn with the viewer's current
-//! window, level, inversion and smoothing. Overlay text is left out, so no
-//! patient details end up in the video.
+//! window, level, inversion, smoothing and sharpening. Overlay text is left
+//! out, so no patient details end up in the video.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,6 +19,7 @@ use crate::colormap::Colormap;
 use crate::decode::{Frame, Pixels, decode_frame};
 use crate::mp4;
 use crate::scan::{FrameRef, open_dicom};
+use crate::sharpen;
 
 /// Ticks per second in the MP4 timeline; divides evenly by common frame rates.
 const TIMESCALE: u32 = 90_000;
@@ -34,6 +35,8 @@ pub struct Settings {
     pub window: Option<(f32, f32)>,
     pub invert: bool,
     pub smooth: bool,
+    /// How much to sharpen; 0 for not at all.
+    pub sharpen: f32,
     pub colormap: Colormap,
 }
 
@@ -166,7 +169,15 @@ pub fn write_video(
         let images: Vec<Option<Vec<u8>>> = chunk
             .par_iter()
             .map(|f| {
-                let frame = load(f).ok()?;
+                let mut frame = load(f).ok()?;
+                if settings.sharpen > 0.0 {
+                    // Sharpen at the scale of a video pixel, as the viewer
+                    // does at the scale of a screen pixel.
+                    let scale = fit_scale(&frame, width, height);
+                    let threshold = sharpen::threshold(&frame);
+                    let sigma = sharpen::sigma_for(scale);
+                    sharpen::apply(&mut frame, settings.sharpen, sigma, threshold);
+                }
                 Some(to_yuv(&frame, width, height, &look))
             })
             .collect();
@@ -249,6 +260,11 @@ fn output_size(w: u32, h: u32) -> (usize, usize) {
     (even(w), even(h))
 }
 
+/// Output pixels per frame pixel when the frame is fitted into the video.
+fn fit_scale(frame: &Frame, width: usize, height: usize) -> f32 {
+    (width as f32 / frame.width as f32).min(height as f32 / frame.height as f32)
+}
+
 fn black_yuv(width: usize, height: usize) -> Vec<u8> {
     let mut yuv = vec![16u8; width * height * 3 / 2];
     yuv[width * height..].fill(128);
@@ -262,7 +278,7 @@ fn to_yuv(frame: &Frame, width: usize, height: usize, look: &Look) -> Vec<u8> {
     let (centre, window_width) = look.window;
     let smooth = look.smooth;
     let (fw, fh) = (frame.width as f32, frame.height as f32);
-    let scale = (width as f32 / fw).min(height as f32 / fh);
+    let scale = fit_scale(frame, width, height);
     let left = (width as f32 - fw * scale) / 2.0;
     let top = (height as f32 - fh * scale) / 2.0;
     let invert = frame.inverted != look.invert;
