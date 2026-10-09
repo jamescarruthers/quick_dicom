@@ -1,19 +1,22 @@
-// Sharpening by unsharp masking, run once per frame at the image's own
-// resolution: a Gaussian blur across, then down, then the image plus some
-// of the detail the blur took out. Detail near the noise level is mostly
-// left alone. Colour images are sharpened in brightness only. `src/sharpen.rs`
-// does the same on the CPU for videos.
+// Filters run once per frame at the image's own resolution, before window
+// and level. Denoising is a bilateral filter: a mean of the neighbours,
+// weighted by distance and by how close their values are, so edges stay.
+// Sharpening is unsharp masking: a Gaussian blur across, then down, then
+// the image plus some of the detail the blur took out, with detail near
+// the noise level mostly left alone. Colour images are judged and sharpened
+// by brightness. `src/filter.rs` does the same on the CPU for videos.
 
 struct Params {
-    // Blur sigma in pixels, taps each side of the centre, amount, and the
-    // noise threshold in texture units.
+    // Denoise: spatial sigma in pixels, taps each side of the centre, range
+    // sigma in texture units, unused. Sharpen: blur sigma in pixels, taps
+    // each side of the centre, amount, noise threshold in texture units.
     p: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
-@group(0) @binding(1) var image: texture_2d<f32>;
-// The blur across, read by the second pass. The first pass binds the image
-// here too, since it draws into this texture.
+@group(0) @binding(1) var source: texture_2d<f32>;
+// The blur across, read by the last sharpening pass. The other passes bind
+// the source here too, since they may draw into this texture.
 @group(0) @binding(2) var across: texture_2d<f32>;
 
 @vertex
@@ -28,16 +31,54 @@ fn vs_full(@builtin(vertex_index) v: u32) -> @builtin(position) vec4<f32> {
 // size. (One function per texture: not every backend takes textures as
 // function arguments.)
 fn clamped(p: vec2<i32>) -> vec2<i32> {
-    let size = vec2<i32>(textureDimensions(image));
+    let size = vec2<i32>(textureDimensions(source));
     return clamp(p, vec2<i32>(0), size - vec2<i32>(1));
 }
 
-fn load_image(p: vec2<i32>) -> vec4<f32> {
-    return textureLoad(image, clamped(p), 0);
+fn load_source(p: vec2<i32>) -> vec4<f32> {
+    return textureLoad(source, clamped(p), 0);
 }
 
 fn load_across(p: vec2<i32>) -> vec4<f32> {
     return textureLoad(across, clamped(p), 0);
+}
+
+@fragment
+fn fs_denoise_gray(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    return denoise(pos, false);
+}
+
+@fragment
+fn fs_denoise_colour(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    return denoise(pos, true);
+}
+
+fn denoise(pos: vec4<f32>, colour: bool) -> vec4<f32> {
+    let p = vec2<i32>(pos.xy);
+    let spatial = params.p.x;
+    let r = i32(params.p.y);
+    let range = params.p.z;
+    let c = load_source(p);
+    if range <= 0.0 {
+        return c;
+    }
+    let to_spatial = -0.5 / (spatial * spatial);
+    let to_range = -0.5 / (range * range);
+    var acc = vec3<f32>(0.0);
+    var total = 0.0;
+    for (var dy = -r; dy <= r; dy++) {
+        for (var dx = -r; dx <= r; dx++) {
+            let q = load_source(p + vec2<i32>(dx, dy)).rgb;
+            let d = q - c.rgb;
+            // Colour difference is the mean square over the channels, so a
+            // grey image in RGB filters as it would in greyscale.
+            let d2 = select(d.r * d.r, dot(d, d) / 3.0, colour);
+            let w = exp(f32(dx * dx + dy * dy) * to_spatial + d2 * to_range);
+            acc += w * q;
+            total += w;
+        }
+    }
+    return vec4<f32>(acc / total, 1.0);
 }
 
 fn weight(i: i32) -> f32 {
@@ -53,7 +94,7 @@ fn fs_across(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     var total = 0.0;
     for (var i = -r; i <= r; i++) {
         let w = weight(i);
-        acc += w * load_image(p + vec2<i32>(i, 0));
+        acc += w * load_source(p + vec2<i32>(i, 0));
         total += w;
     }
     return acc / total;
@@ -92,7 +133,7 @@ fn down(pos: vec4<f32>, colour: bool) -> vec4<f32> {
         blur += w * load_across(p + vec2<i32>(0, i));
         total += w;
     }
-    let v = load_image(p);
+    let v = load_source(p);
     let d = v - blur / total;
     if !colour {
         return vec4<f32>(v.r + params.p.z * core(d.r), 0.0, 0.0, 1.0);
