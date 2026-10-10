@@ -11,6 +11,7 @@ use eframe::egui_wgpu;
 use crate::colormap::Colormap;
 use crate::decode::{Frame, Spacing};
 use crate::export::{self, Export};
+use crate::filter::{self, Filters, Level};
 use crate::loader::{Loader, Slot};
 use crate::render::{ImageCallback, ImageRenderer, Uniforms};
 use crate::render3d::{VolumeCallback, VolumeRenderer, VolumeUniforms};
@@ -35,6 +36,7 @@ struct View {
     window: Option<(f32, f32)>,
     invert: bool,
     smooth: bool,
+    filters: Filters,
     colormap: Colormap,
     /// Show millimetre rulers when the file gives a pixel size.
     rulers: bool,
@@ -48,6 +50,7 @@ impl Default for View {
             window: None,
             invert: false,
             smooth: true,
+            filters: Filters::default(),
             colormap: Colormap::Grey,
             rulers: true,
         }
@@ -134,6 +137,8 @@ pub struct ViewerApp {
     volume_job: Option<VolumeJob>,
     /// Largest texture side the GPU takes.
     max_side: u32,
+    /// The GPU can draw into the textures denoising and sharpening need.
+    can_filter: bool,
     /// Set by the 3D renderer when the GPU cannot take a volume.
     gpu_error: Arc<Mutex<Option<String>>>,
 }
@@ -145,7 +150,7 @@ impl ViewerApp {
             .wgpu_render_state
             .as_ref()
             .expect("the wgpu renderer is required");
-        ImageRenderer::install(rs);
+        let can_filter = ImageRenderer::install(rs);
         VolumeRenderer::install(rs);
         let max_dim = rs.device.limits().max_texture_dimension_2d;
 
@@ -181,6 +186,7 @@ impl ViewerApp {
             volume: None,
             volume_job: None,
             max_side: max_dim,
+            can_filter,
             gpu_error: Arc::default(),
         };
         if let Some(p) = path {
@@ -256,6 +262,7 @@ impl ViewerApp {
             window: self.view.window,
             invert: self.view.invert,
             smooth: self.view.smooth,
+            filters: self.view.filters,
             colormap: self.view.colormap,
         };
         self.export = Some(Export::start(settings, path, ctx.clone()));
@@ -307,6 +314,7 @@ impl ViewerApp {
         };
         self.view = View {
             smooth: self.view.smooth,
+            filters: self.view.filters,
             colormap: self.view.colormap,
             rulers: self.view.rulers,
             ..View::default()
@@ -534,6 +542,9 @@ impl ViewerApp {
         let fit = pressed(Key::F);
         let invert = pressed(Key::I);
         let smooth = pressed(Key::S);
+        let denoise = pressed(Key::N);
+        let sharpen = pressed(Key::E);
+        let contrast = pressed(Key::L);
         let colours = pressed(Key::C);
         let rulers = pressed(Key::M);
         let three_d = pressed(Key::D);
@@ -563,6 +574,12 @@ impl ViewerApp {
         if smooth % 2 == 1 {
             self.view.smooth = !self.view.smooth;
         }
+        let f = &mut self.view.filters;
+        if self.can_filter {
+            (0..denoise).for_each(|_| f.denoise = f.denoise.next());
+            (0..sharpen).for_each(|_| f.sharpen = f.sharpen.next());
+        }
+        (0..contrast).for_each(|_| f.contrast = f.contrast.next());
         for _ in 0..colours {
             self.view.colormap = self.view.colormap.next();
         }
@@ -661,6 +678,7 @@ impl ViewerApp {
                 .on_hover_text("I");
             ui.toggle_value(&mut self.view.smooth, "Smooth")
                 .on_hover_text("S: bilinear filtering on or off");
+            self.filters_menu(ui);
             let is_ct = self.stack().is_some_and(|s| s.modality == "CT");
             ui.add_enabled_ui(is_ct, |ui| {
                 egui::ComboBox::from_id_salt("preset")
@@ -710,6 +728,58 @@ impl ViewerApp {
                 }
             });
         });
+    }
+
+    /// Denoise, sharpen and local contrast, each off or at one of three
+    /// strengths. The menu stays open while they change, so the effect shows.
+    fn filters_menu(&mut self, ui: &mut egui::Ui) {
+        let f = &mut self.view.filters;
+        let on = *f != Filters::default();
+        let button = egui::Button::new("Filters").selected(on);
+        let config = egui::containers::menu::MenuConfig::new()
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        let can_filter = self.can_filter;
+        egui::containers::menu::MenuButton::from_button(button)
+            .config(config)
+            .ui(ui, |ui| {
+                egui::Grid::new("filters").num_columns(5).show(ui, |ui| {
+                    let rows: [(&str, &str, &mut Level, bool); 3] = [
+                        (
+                            "Denoise",
+                            "N: smooth away noise but keep edges",
+                            &mut f.denoise,
+                            can_filter,
+                        ),
+                        (
+                            "Sharpen",
+                            "E: sharpen edges; detail at the level of the noise is left alone",
+                            &mut f.sharpen,
+                            can_filter,
+                        ),
+                        (
+                            "Local contrast",
+                            "L: bring out detail in dark and bright parts at once",
+                            &mut f.contrast,
+                            true,
+                        ),
+                    ];
+                    for (name, hint, level, enabled) in rows {
+                        ui.label(name).on_hover_text(if enabled {
+                            hint
+                        } else {
+                            "This GPU cannot run it"
+                        });
+                        for l in Level::ALL {
+                            ui.add_enabled_ui(enabled, |ui| {
+                                ui.selectable_value(level, l, l.name())
+                            });
+                        }
+                        ui.end_row();
+                    }
+                });
+            })
+            .0
+            .on_hover_text("Denoise (N), sharpen (E) and local contrast (L)");
     }
 
     fn bottom_bar(&mut self, ui: &mut egui::Ui) {
@@ -1037,6 +1107,8 @@ impl ViewerApp {
             ImageCallback {
                 frame: frame.clone(),
                 uniforms,
+                filters: self.view.filters,
+                sigma: filter::sigma_for(scale * ui.ctx().pixels_per_point()),
             },
         ));
 

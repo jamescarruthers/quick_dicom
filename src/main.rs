@@ -4,13 +4,17 @@
 mod app;
 mod check;
 mod colormap;
+mod contrast;
 mod decode;
 mod export;
+mod filter;
 mod loader;
 mod mp4;
 mod render;
 mod render3d;
 mod scan;
+#[cfg(test)]
+mod testing;
 mod volume;
 
 use std::path::PathBuf;

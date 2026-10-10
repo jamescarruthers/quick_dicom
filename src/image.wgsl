@@ -1,11 +1,12 @@
 // Draws one DICOM frame. Raw modality values live in the texture; window,
-// level, inversion and filtering all happen here, so changing them never
-// touches the CPU copy.
+// level, local contrast, inversion and filtering all happen here, so
+// changing them never touches the CPU copy.
 
 struct Uniforms {
     // Image corners in clip space: x0, y0 (top-left), x1, y1 (bottom-right).
     rect: vec4<f32>,
-    // Texture width, height.
+    // Texture width, height, then local contrast tiles across and down (0
+    // when local contrast is off).
     tex: vec4<f32>,
     // Window centre, window width, value scale, invert (0 or 1).
     wl: vec4<f32>,
@@ -15,6 +16,8 @@ struct Uniforms {
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var img: texture_2d<f32>;
+// Local contrast curves: one row of 256 per tile, row after row of tiles.
+@group(0) @binding(2) var curves: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -50,6 +53,29 @@ fn bilinear(t: vec2<f32>) -> vec3<f32> {
     return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
 }
 
+// One tile's curve at brightness g, between its two nearest steps.
+fn curve(tile: vec2<i32>, g: f32) -> f32 {
+    let row = tile.y * i32(u.tex.z) + tile.x;
+    let b = clamp(g * 256.0 - 0.5, 0.0, 255.0);
+    let i = i32(floor(b));
+    let lo = textureLoad(curves, vec2<i32>(i, row), 0).r;
+    let hi = textureLoad(curves, vec2<i32>(min(i + 1, 255), row), 0).r;
+    return mix(lo, hi, b - f32(i));
+}
+
+// Local contrast at texel position t: the four nearest tiles' curves,
+// blended by distance, as `Curves::map` does in src/contrast.rs.
+fn local_contrast(g: f32, t: vec2<f32>) -> f32 {
+    let grid = u.tex.zw;
+    let p = clamp(t / u.tex.xy * grid - 0.5, vec2<f32>(0.0), grid - 1.0);
+    let i = vec2<i32>(floor(p));
+    let f = p - vec2<f32>(i);
+    let j = min(i + vec2<i32>(1), vec2<i32>(grid) - vec2<i32>(1));
+    let top = mix(curve(i, g), curve(vec2<i32>(j.x, i.y), g), f.x);
+    let bottom = mix(curve(vec2<i32>(i.x, j.y), g), curve(j, g), f.x);
+    return mix(top, bottom, f.y);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let t = in.uv * u.tex.xy;
@@ -62,8 +88,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     } else {
         // When zoomed out, average several samples per screen pixel so fine
         // detail does not alias.
+        // The 1% margin keeps rounding at 100% zoom from averaging four
+        // samples in some 2x2 blocks of pixels and not others.
         let footprint = max(length(dx), length(dy));
-        let n = i32(clamp(ceil(footprint), 1.0, 4.0));
+        let n = i32(clamp(ceil(footprint - 0.01), 1.0, 4.0));
         if n == 1 {
             v = bilinear(t);
         } else {
@@ -81,6 +109,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let x = v * u.wl.z;
     let width = max(u.wl.y, 1e-6);
     var g = clamp((x - (u.wl.x - 0.5 * width)) / width, vec3<f32>(0.0), vec3<f32>(1.0));
+    if u.tex.z > 0.5 {
+        if u.mode.x > 0.5 {
+            // Colour: change only the brightness of grey parts, adding the
+            // same to each channel. Colour such as Doppler stays as it is.
+            let lum = dot(g, vec3<f32>(0.2126, 0.7152, 0.0722));
+            let spread = max(g.r, max(g.g, g.b)) - min(g.r, min(g.g, g.b));
+            let grey = clamp(1.0 - 10.0 * spread, 0.0, 1.0);
+            let shift = (local_contrast(lum, t) - lum) * grey;
+            g = clamp(g + shift, vec3<f32>(0.0), vec3<f32>(1.0));
+        } else {
+            g = vec3<f32>(local_contrast(g.r, t));
+        }
+    }
     if u.wl.w > 0.5 {
         g = 1.0 - g;
     }
