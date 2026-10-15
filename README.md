@@ -25,6 +25,8 @@ you scrub through each series or cine loop.
   each image's own noise.
 - Shows a series as a 3D volume, ray cast on the GPU with lighting and dark
   parts see-through, or as a maximum intensity projection.
+- Sends a series to a MONAI Label server for AI segmentation, and outlines
+  the organs it finds on each slice and colours them in 3D.
 
 ## Get it
 
@@ -78,6 +80,7 @@ quick_dicom image.dcm       # open the file's folder and select that image
 | Change the colour map   | Colour menu in the toolbar              | C                        |
 | Show or hide rulers     | Rulers button                           | M                        |
 | Switch 3D on or off     | 3D button                               | D                        |
+| Show or hide AI labels  | MONAI menu in the toolbar               | G                        |
 
 The CT presets are 1 soft tissue, 2 lung, 3 bone, 4 brain and 5 liver.
 
@@ -211,6 +214,54 @@ changed is not drawn again.
 If the GPU cannot hold the volume, the 3D view closes and the status line
 says why, so you can turn off Full detail and try again.
 
+### AI segmentation with MONAI Label
+
+The **MONAI** menu sends the current series to a
+[MONAI Label](https://github.com/Project-MONAI/MONAILabel) server, which runs
+an AI model on it and sends back the structures it finds. The viewer then
+outlines each one, in its own colour, on every slice, and shows them solid
+in the 3D view, with the rest of the scan faint around them. The value
+under the pointer gains the name of the structure there.
+
+MONAI Label is a free server from Project MONAI, written in Python. It runs
+on Windows, macOS and Linux, on the CPU or, much faster, on an NVIDIA GPU.
+Set it up once:
+
+```sh
+pip install monailabel
+monailabel apps --download --name radiology --output apps
+mkdir data
+monailabel start_server --app apps/radiology --studies data --conf models segmentation
+```
+
+The first start downloads the model. `data` can stay empty: the viewer
+sends the images itself. Useful models in the radiology app:
+
+| Model                  | Finds                                                                          |
+|------------------------|--------------------------------------------------------------------------------|
+| `segmentation`         | 25 structures in chest and abdomen CT: liver, spleen, kidneys, lungs, heart, aorta and others |
+| `segmentation_spleen`  | The spleen in CT                                                               |
+| `segmentation_vertebra`| Each vertebra in CT                                                            |
+
+Several can run at once: `--conf models segmentation,segmentation_spleen`.
+
+In the viewer, open **MONAI**, check the address (`http://127.0.0.1:8000`
+for a server on the same machine), click **Connect**, pick a model and
+click **Segment this series**. A model takes seconds on a GPU and up to a
+few minutes on a CPU; the status line shows how it is going. **Show
+labels** (G) hides and shows the result, and the menu lists the structures
+found, with their colours.
+
+To use a server on another machine, start it with `--host 0.0.0.0` and
+connect to that machine's address. Set `QUICK_DICOM_MONAI` to change the
+address the menu starts with, for example
+`QUICK_DICOM_MONAI=http://gpu-box:8000 quick_dicom /scans`.
+
+The server gets the series' pixel values and slice geometry, as one NIfTI
+volume, and nothing else: no names, IDs or dates. Over plain `http://` the
+pixels cross the network unencrypted, so use `https://` for a server
+outside your own network.
+
 ### Save a video
 
 **Save MP4…** writes the current series or loop as an H.264 MP4, which plays
@@ -258,6 +309,10 @@ example `QUICK_DICOM_CACHE_MB=8000 quick_dicom /scans`.
 - The 3D view has no tools to cut parts away: to see past bone, narrow the
   window or use MIP. With thick slices, smooth surfaces show faint steps
   where the slices were. Videos always show the 2D slices.
+- AI labels stay only while the viewer runs, one series at a time. Videos
+  and MIP leave them out. Colour series cannot be segmented. The MONAI
+  models are research tools, not cleared for diagnosis, and work best on
+  the kind of scan they learned from (most of the radiology app's on CT).
 
 ## How it works
 
@@ -267,12 +322,14 @@ example `QUICK_DICOM_CACHE_MB=8000 quick_dicom /scans`.
 | `src/loader.rs`    | Worker threads decode the frames the view asks for, nearest first, into a cache bounded by memory. Multi-frame files stay open between frames.               |
 | `src/decode.rs`    | Reads uncompressed and RLE pixel data directly, so one frame of a large file costs one frame. Other codecs go through `dicom-pixeldata`.                     |
 | `src/render.rs`    | Uploads each frame to the GPU as 32-bit floats, or RGBA for colour, and draws it inside the egui window.                                                     |
-| `src/image.wgsl`   | Applies window, level, local contrast and inversion, and samples the image: bilinear when zoomed in, several samples per pixel when zoomed out.             |
+| `src/image.wgsl`   | Applies window, level, local contrast and inversion, and samples the image: bilinear when zoomed in, several samples per pixel when zoomed out. Outlines AI labels. |
 | `src/export.rs`    | Draws each frame with the current window into YUV, as the shader would, and encodes it with OpenH264 on a background thread.                                |
 | `src/mp4.rs`       | Writes the H.264 frames into an MP4 file, with the index before the data so playback can start before the file has loaded.                                   |
 | `src/volume.rs`    | Builds the 3D volume in the background: decodes every slice, keeps raw values as 16-bit floats, and works out the gap between slices from their positions.  |
 | `src/render3d.rs`  | Puts the volume on the GPU as one 3D texture, casts the rays into an offscreen image when the view changes, then puts that image on screen.                  |
-| `src/volume.wgsl`  | The 3D shaders: marches each ray through the volume front to back, applying window, colour map, opacity and lighting, or keeps the brightest value for MIP.  |
+| `src/volume.wgsl`  | The 3D shaders: marches each ray through the volume front to back, applying window, colour map, opacity and lighting, or keeps the brightest value for MIP. Colours AI labels. |
+| `src/monai.rs`     | Talks to a MONAI Label server on a background thread: lists its models, reads the series at full resolution, sends it, and reads back the labels.           |
+| `src/nifti.rs`     | Writes the series as a NIfTI volume, with its position in the patient taken from the DICOM slice positions, and reads the labels the server returns.       |
 | `src/colormap.rs`  | The colour maps, with twins in `src/common.wgsl` for the GPU.                                                                                               |
 | `src/filter.rs`    | Denoising and sharpening: measures each image's noise, runs the GPU passes, and does the same on the CPU for videos.                                        |
 | `src/filter.wgsl`  | The filter shaders: a bilateral filter, then a Gaussian blur across and down and the image plus the detail the blur removed.                                |

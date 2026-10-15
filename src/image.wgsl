@@ -12,9 +12,13 @@ struct Uniforms {
     wl: vec4<f32>,
     // Colour (0 or 1), smooth (0 or 1), sRGB target (0 or 1), colour map.
     mode: vec4<f32>,
+    // Segmentation labels shown (0 or 1), their width and height, unused.
+    labels: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
+// One slice of segmentation labels, 0 for none.
+@group(1) @binding(0) var label_map: texture_2d<u32>;
 @group(0) @binding(1) var img: texture_2d<f32>;
 // Local contrast curves: one row of 256 per tile, row after row of tiles.
 @group(0) @binding(2) var curves: texture_2d<f32>;
@@ -51,6 +55,14 @@ fn bilinear(t: vec2<f32>) -> vec3<f32> {
     let c = fetch(i + vec2<i32>(0, 1));
     let d = fetch(i + vec2<i32>(1, 1));
     return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
+}
+
+fn label_at(q: vec2<i32>) -> u32 {
+    let size = vec2<i32>(u.labels.yz);
+    if any(q < vec2<i32>(0)) || any(q >= size) {
+        return 0u;
+    }
+    return textureLoad(label_map, q, 0).r;
 }
 
 // One tile's curve at brightness g, between its two nearest steps.
@@ -127,6 +139,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
     if u.mode.x < 0.5 {
         g = colormap(g.r, u.mode.w);
+    }
+    // Segmentation labels: a tint over each labelled region, solid along
+    // its edges, where a neighbouring pixel has another label.
+    if u.labels.x > 0.5 {
+        let q = vec2<i32>(floor(t / u.tex.xy * u.labels.yz));
+        let id = label_at(q);
+        if id > 0u {
+            let edge = label_at(q + vec2<i32>(1, 0)) != id || label_at(q - vec2<i32>(1, 0)) != id
+                || label_at(q + vec2<i32>(0, 1)) != id || label_at(q - vec2<i32>(0, 1)) != id;
+            let c = label_colour(id);
+            g = select(mix(g, c, 0.35), c, edge);
+        }
     }
     if u.mode.z > 0.5 {
         g = srgb_to_linear(g);

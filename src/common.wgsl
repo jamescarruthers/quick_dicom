@@ -1,4 +1,5 @@
-// Shared by the 2D and 3D shaders. `colormap` must match src/colormap.rs.
+// Shared by the 2D and 3D shaders. `colormap` and `label_colour` must match
+// src/colormap.rs.
 
 fn colormap(g_in: f32, kind: f32) -> vec3<f32> {
     let g = clamp(g_in, 0.0, 1.0);
@@ -23,6 +24,13 @@ fn colormap(g_in: f32, kind: f32) -> vec3<f32> {
     let x = g * 7.0;
     let i = min(i32(floor(x)), 6);
     return mix(stops[i], stops[i + 1], x - f32(i));
+}
+
+// The colour of a segmentation label: hues a golden-ratio turn apart.
+fn label_colour(id: u32) -> vec3<f32> {
+    let h = fract(f32(id) * 0.618034);
+    let k = (vec3<f32>(5.0, 3.0, 1.0) + h * 6.0) % vec3<f32>(6.0);
+    return 1.0 - 0.65 * clamp(min(k, 4.0 - k), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {

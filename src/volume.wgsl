@@ -23,11 +23,16 @@ struct Uniforms {
     wl: vec4<f32>,
     // Density, mode (0 blend, 1 maximum intensity), sRGB target, shading.
     look: vec4<f32>,
+    // Segmentation labels shown (0 or 1), every how many label slices the
+    // volume took one, unused, unused.
+    labels: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var volume: texture_3d<f32>;
 @group(0) @binding(2) var volume_sampler: sampler;
+// Segmentation labels at the scan's full resolution, 0 for none.
+@group(1) @binding(0) var label_map: texture_3d<u32>;
 
 struct RayIn {
     @builtin(position) pos: vec4<f32>,
@@ -59,6 +64,45 @@ fn to_texture(p: vec3<f32>) -> vec3<f32> {
 
 fn value(p: vec3<f32>) -> f32 {
     return textureSampleLevel(volume, volume_sampler, to_texture(p), 0.0).r;
+}
+
+// The label at a model point: the labels cover the same box as the
+// volume, at their own resolution, and the volume may hold only every
+// so many of their slices.
+fn label_at(p: vec3<f32>) -> u32 {
+    let size = vec3<i32>(textureDimensions(label_map));
+    let tex = to_texture(p);
+    let layer = tex.z * u.dims.z - 0.5;
+    let q = vec3<i32>(
+        i32(floor(tex.x * f32(size.x))),
+        i32(floor(tex.y * f32(size.y))),
+        i32(round(layer * u.labels.y)),
+    );
+    if any(q < vec3<i32>(0)) || any(q >= size) {
+        return 0u;
+    }
+    return textureLoad(label_map, q, 0).r;
+}
+
+fn inside(p: vec3<f32>, id: u32) -> f32 {
+    return select(0.0, 1.0, label_at(p) == id);
+}
+
+// Light on a labelled region, from the slope of the region's own edge, so
+// organs show their shape whatever the scan looks like there.
+fn lit_label(c: vec3<f32>, p: vec3<f32>, dir: vec3<f32>, id: u32) -> vec3<f32> {
+    let e = vec3<f32>(1.5, 1.5, 1.5 * gap());
+    let grad = vec3<f32>(
+        inside(p + vec3<f32>(e.x, 0.0, 0.0), id) - inside(p - vec3<f32>(e.x, 0.0, 0.0), id),
+        inside(p + vec3<f32>(0.0, e.y, 0.0), id) - inside(p - vec3<f32>(0.0, e.y, 0.0), id),
+        inside(p + vec3<f32>(0.0, 0.0, e.z), id) - inside(p - vec3<f32>(0.0, 0.0, e.z), id),
+    ) / e;
+    let size = length(grad);
+    if size < 1e-6 {
+        return c;
+    }
+    let facing = abs(dot(grad / size, dir));
+    return c * (0.35 + 0.65 * facing) + vec3<f32>(0.1 * pow(facing, 8.0));
 }
 
 // Brightness through the window, before inversion.
@@ -158,6 +202,13 @@ fn fs_ray(in: RayIn) -> @location(0) vec4<f32> {
         return vec4<f32>(m);
     }
 
+    let labels_on = u.labels.x > 0.5;
+    // Labelled tissue is nine tenths opaque per voxel.
+    let solid = 1.0 - pow(0.1, 1.0 / u.slices.w);
+    // With labels shown, the rest of the scan is a faint surround: in all
+    // it lets at least this much light through.
+    let surround = 0.75;
+    var clear = 1.0;
     var colour = vec3<f32>(0.0);
     var alpha = 0.0;
     var plane_left = plane_at < 1e29;
@@ -170,11 +221,29 @@ fn fs_ray(in: RayIn) -> @location(0) vec4<f32> {
         }
         let p = origin + dir * s;
         let g = shown(value(p));
-        let opacity = t * (1.0 - pow(max(1.0 - g, 1e-6), k));
+        var opacity = t * (1.0 - pow(max(1.0 - g, 1e-6), k));
+        var id = 0u;
+        if labels_on {
+            id = label_at(p);
+            if id > 0u {
+                opacity = t * solid;
+            } else {
+                opacity = min(opacity, 1.0 - surround / clear);
+                clear *= 1.0 - opacity;
+            }
+        }
         if opacity > 0.002 {
-            var c = colormap(g, u.wl.w);
-            if u.look.w > 0.5 {
-                c = lit(c, p, dir);
+            var c: vec3<f32>;
+            if id > 0u {
+                c = label_colour(id);
+                if u.look.w > 0.5 {
+                    c = lit_label(c, p, dir, id);
+                }
+            } else {
+                c = colormap(g, u.wl.w);
+                if u.look.w > 0.5 {
+                    c = lit(c, p, dir);
+                }
             }
             colour += (1.0 - alpha) * opacity * c;
             alpha += (1.0 - alpha) * opacity;
