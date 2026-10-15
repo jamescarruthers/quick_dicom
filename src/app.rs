@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Key, Layout, Modifiers, PointerButton, Pos2, Rect, Sense,
@@ -14,7 +14,7 @@ use crate::export::{self, Export};
 use crate::filter::{self, Filters, Level};
 use crate::loader::{Loader, Slot};
 use crate::render::{ImageCallback, ImageRenderer, Uniforms};
-use crate::render3d::{VolumeCallback, VolumeRenderer, VolumeUniforms};
+use crate::render3d::{Scene, VolumeCallback, VolumeRenderer, VolumeUniforms};
 use crate::scan::{FrameRef, Library, ScanEvent, Scanner, Stack};
 use crate::volume::{Volume, VolumeJob};
 
@@ -57,10 +57,10 @@ impl Default for View {
     }
 }
 
-/// How the 3D view combines its slices.
+/// How the 3D view combines the samples along each line of sight.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Combine {
-    /// Each slice covers those behind it, more where it is brighter.
+    /// Each sample covers those behind it, more where it is brighter.
     Blend,
     /// Each screen pixel shows the brightest value along its line of sight.
     Maximum,
@@ -68,22 +68,29 @@ enum Combine {
 
 const DEFAULT_YAW: f32 = 0.6;
 const DEFAULT_PITCH: f32 = -0.45;
-/// Seconds the turn from flat slice to 3D stack takes.
+/// Seconds the turn from flat slice to 3D volume takes.
 const TRANSITION_SECONDS: f32 = 0.9;
+/// After the view last moved, how long the 3D view stays at half
+/// resolution before drawing in full.
+const SETTLE: Duration = Duration::from_millis(200);
 
 struct ThreeD {
     /// The user wants the 3D view.
     on: bool,
-    /// How far the turn into 3D has got: 0 is the flat slice, 1 the stack.
+    /// How far the turn into 3D has got: 0 is the flat slice, 1 the volume.
     t: f32,
     clock: Option<Instant>,
     yaw: f32,
     pitch: f32,
     /// Multiplies the true gap between slices.
     depth: f32,
-    /// How quickly bright voxels become opaque, summed over the stack.
+    /// How quickly bright voxels become opaque, summed over the volume.
     density: f32,
     combine: Combine,
+    /// Light the volume from the viewer, so surfaces show their shape.
+    shading: bool,
+    /// When the view last turned, panned, zoomed or changed window.
+    moved: Option<Instant>,
     /// Every slice at full resolution, rather than at most 256 slices of
     /// at most 512 pixels.
     full_detail: bool,
@@ -98,8 +105,10 @@ impl Default for ThreeD {
             yaw: DEFAULT_YAW,
             pitch: DEFAULT_PITCH,
             depth: 1.0,
-            density: 8.0,
+            density: 30.0,
             combine: Combine::Blend,
+            shading: true,
+            moved: None,
             full_detail: true,
         }
     }
@@ -135,7 +144,7 @@ pub struct ViewerApp {
     three_d: ThreeD,
     volume: Option<Arc<Volume>>,
     volume_job: Option<VolumeJob>,
-    /// Largest texture side the GPU takes.
+    /// Largest side of a 3D texture the GPU takes.
     max_side: u32,
     /// The GPU can draw into the textures denoising and sharpening need.
     can_filter: bool,
@@ -153,6 +162,7 @@ impl ViewerApp {
         let can_filter = ImageRenderer::install(rs);
         VolumeRenderer::install(rs);
         let max_dim = rs.device.limits().max_texture_dimension_2d;
+        let max_3d = rs.device.limits().max_texture_dimension_3d;
 
         let budget_mb = std::env::var("QUICK_DICOM_CACHE_MB")
             .ok()
@@ -185,7 +195,7 @@ impl ViewerApp {
             three_d: ThreeD::default(),
             volume: None,
             volume_job: None,
-            max_side: max_dim,
+            max_side: max_3d,
             can_filter,
             gpu_error: Arc::default(),
         };
@@ -716,7 +726,7 @@ impl ViewerApp {
             let can_3d = self.can_3d();
             ui.add_enabled_ui(can_3d, |ui| {
                 ui.toggle_value(&mut self.three_d.on, "3D").on_hover_text(
-                    "D: stack the slices in 3D. Drag to turn, Ctrl+drag for \
+                    "D: show the series as a 3D volume. Drag to turn, Ctrl+drag for \
                      window and level, wheel to zoom.",
                 );
             });
@@ -843,7 +853,7 @@ impl ViewerApp {
                         Combine::Maximum => "MIP",
                     })
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.three_d.combine, Combine::Blend, "Blend")
+                                ui.selectable_value(&mut self.three_d.combine, Combine::Blend, "Blend")
                             .on_hover_text("Bright parts are solid, dark parts clear");
                         ui.selectable_value(&mut self.three_d.combine, Combine::Maximum, "MIP")
                             .on_hover_text("Maximum intensity projection: the brightest value along each line of sight");
@@ -857,6 +867,11 @@ impl ViewerApp {
                         .prefix("Opacity "),
                 )
                 .on_hover_text("How quickly bright parts block the view");
+                ui.add_enabled(
+                    self.three_d.combine == Combine::Blend,
+                    egui::Checkbox::new(&mut self.three_d.shading, "Shade"),
+                )
+                .on_hover_text("Light the volume from the front, so surfaces show their shape");
                 ui.add(
                     egui::DragValue::new(&mut self.three_d.depth)
                         .range(0.1..=10.0)
@@ -864,7 +879,7 @@ impl ViewerApp {
                         .max_decimals(2)
                         .prefix("Depth ×"),
                 )
-                .on_hover_text("Stretch or squash the gap between slices");
+                .on_hover_text("Stretch or squash the volume's depth, the gap between slices");
                 let mb = (stack.max_rows as u64 * stack.max_cols as u64 * n as u64 * 2) >> 20;
                 ui.toggle_value(&mut self.three_d.full_detail, "Full detail")
                     .on_hover_text(format!(
@@ -1189,12 +1204,19 @@ impl ViewerApp {
         }
     }
 
-    /// Left-drag turns the stack, Ctrl/Cmd-drag sets the window, wheel
+    /// Left-drag turns the volume, Ctrl/Cmd-drag sets the window, wheel
     /// zooms, right/middle/Shift-drag pans.
     fn interact_3d(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: Rect, range: f32) {
         if resp.hovered() {
             let (zoom, lines) = ui.ctx().input(|i| (i.zoom_delta(), wheel_lines(i)));
-            self.zoom_about(resp, rect, zoom * 1.1f32.powf(lines));
+            let factor = zoom * 1.1f32.powf(lines);
+            if factor != 1.0 {
+                self.three_d.moved = Some(Instant::now());
+            }
+            self.zoom_about(resp, rect, factor);
+        }
+        if resp.dragged() {
+            self.three_d.moved = Some(Instant::now());
         }
         let m = ui.ctx().input(|i| i.modifiers);
         let d = resp.drag_delta();
@@ -1250,49 +1272,48 @@ impl ViewerApp {
             volume.height as f32,
             volume.depth as f32,
         );
-        // Shrink a little as the stack turns, so its corners stay in view.
-        let fit = (rect.width() / w).min(rect.height() / h);
-        let s = fit * self.view.zoom * (1.0 - 0.3 * t);
-        let centre = rect.center() + self.view.pan;
-        let r = rotation(self.three_d.yaw * t, self.three_d.pitch * t);
-        // Without positions in the files, make the stack half as deep as wide.
-        let gap = volume.slice_gap.unwrap_or(w.max(h) * 0.5 / d.max(1.0)) * self.three_d.depth;
-        let current = ((self.index / volume.stride) as f32).min(d - 1.0);
-        // Turn about the current slice at first, the middle of the stack at the end.
-        let pivot = current + ((d - 1.0) * 0.5 - current) * t;
-        let dz = gap * t;
-        let (kx, ky) = (2.0 * s / rect.width(), 2.0 * s / rect.height());
-        let mx = [
-            kx * r[0][0],
-            kx * r[0][1],
-            kx * r[0][2],
-            2.0 * (centre.x - rect.left()) / rect.width() - 1.0,
-        ];
-        let my = [
-            -ky * r[1][0],
-            -ky * r[1][1],
-            -ky * r[1][2],
-            1.0 - 2.0 * (centre.y - rect.top()) / rect.height(),
-        ];
-        // Screen depth grows away from the viewer: draw the far end first.
-        let reverse = r[2][2] * dz > 0.0;
         if self.view.window.is_none() {
             self.view.window = Some(volume.window);
         }
-        let (wc, ww) = self.view.window.unwrap_or(volume.window);
-        let invert = volume.inverted != self.view.invert;
         let maximum = self.three_d.combine == Combine::Maximum;
-        let uniforms = VolumeUniforms {
-            mx,
-            my,
-            dims: [w, h, d, current],
-            slices: [dz, pivot, t, reverse as u8 as f32],
-            wl: [wc, ww, invert as u8 as f32, self.view.colormap.shader_id()],
-            look: [self.three_d.density, maximum as u8 as f32, 0.0, 0.0],
+        // While the view turns or moves, cast half the rays with half the
+        // samples each; draw in full once it rests.
+        let moving =
+            self.three_d.t < 1.0 || self.three_d.moved.is_some_and(|m| m.elapsed() < SETTLE);
+        // Shrink a little as the volume turns, so its corners stay in view.
+        let fit = (rect.width() / w).min(rect.height() / h);
+        let centre = rect.center() + self.view.pan - rect.min;
+        let scene = Scene {
+            view: (rect.width(), rect.height()),
+            centre: (centre.x, centre.y),
+            scale: fit * self.view.zoom * (1.0 - 0.3 * t),
+            yaw: self.three_d.yaw,
+            pitch: self.three_d.pitch,
+            // Without positions in the files, make the volume half as deep
+            // as it is wide.
+            gap: volume.slice_gap.unwrap_or(w.max(h) * 0.5 / d.max(1.0)) * self.three_d.depth,
+            current: ((self.index / volume.stride) as f32).min(d - 1.0),
+            t,
+            window: self.view.window.unwrap_or(volume.window),
+            invert: volume.inverted != self.view.invert,
+            colormap: self.view.colormap.shader_id(),
+            density: self.three_d.density,
+            maximum,
+            shading: self.three_d.shading,
+            fine: !moving,
         };
+        let (wc, ww) = scene.window;
+        let uniforms = VolumeUniforms::new(&scene, w, h, d);
+        if moving {
+            painter.ctx().request_repaint_after(SETTLE);
+        }
+        // At most about two million rays: sharp on most screens, and few
+        // enough that a slow GPU finishes a frame well within its time limit.
+        let full = ppp.min((2.0e6 / (rect.width() * rect.height()).max(1.0)).sqrt());
+        let resolution = if moving { 0.5 * full } else { full };
         let size_px = (
-            (rect.width() * ppp).round() as u32,
-            (rect.height() * ppp).round() as u32,
+            (rect.width() * resolution).round() as u32,
+            (rect.height() * resolution).round() as u32,
         );
         painter.add(egui_wgpu::Callback::new_paint_callback(
             rect,
@@ -1300,7 +1321,6 @@ impl ViewerApp {
                 volume: volume.clone(),
                 uniforms,
                 size_px,
-                maximum_intensity: maximum,
                 error: self.gpu_error.clone(),
             },
         ));
@@ -1459,19 +1479,6 @@ fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Rotation turning by `yaw` about the screen's vertical axis, then by
-/// `pitch` about its horizontal axis. Rows are screen x (right), y (down)
-/// and z (into the screen).
-fn rotation(yaw: f32, pitch: f32) -> [[f32; 3]; 3] {
-    let (sy, cy) = yaw.sin_cos();
-    let (sp, cp) = pitch.sin_cos();
-    [
-        [cy, 0.0, sy],
-        [sp * sy, cp, -sp * cy],
-        [-cp * sy, sp, cp * cy],
-    ]
-}
-
 fn ordinal(n: usize) -> String {
     let suffix = match (n % 10, n % 100) {
         (1, 11) | (2, 12) | (3, 13) => "th",
@@ -1609,13 +1616,5 @@ mod tests {
         assert_eq!(length_label(50.0), "5 cm");
         assert_eq!(length_label(5.0), "5 mm");
         assert_eq!(length_label(0.5), "0.5 mm");
-    }
-
-    #[test]
-    fn rotation_is_identity_at_rest() {
-        assert_eq!(
-            super::rotation(0.0, 0.0),
-            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
-        );
     }
 }
