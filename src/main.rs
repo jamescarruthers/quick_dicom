@@ -59,6 +59,8 @@ fn main() {
                 label: Some("quick_dicom"),
                 required_limits: wgpu::Limits {
                     max_texture_dimension_2d: adapter.limits().max_texture_dimension_2d.min(16384),
+                    // The 3D view keeps the whole volume in one 3D texture.
+                    max_texture_dimension_3d: adapter.limits().max_texture_dimension_3d.min(16384),
                     ..base
                 },
                 ..Default::default()

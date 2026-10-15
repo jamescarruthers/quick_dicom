@@ -23,8 +23,8 @@ you scrub through each series or cine loop.
 - Colours greyscale images with hot-iron or rainbow maps.
 - Filters out noise, sharpens edges and boosts local contrast, scaled to
   each image's own noise.
-- Turns a series into a 3D stack of slices, with dark parts see-through, or
-  a maximum intensity projection.
+- Shows a series as a 3D volume, ray cast on the GPU with lighting and dark
+  parts see-through, or as a maximum intensity projection.
 
 ## Get it
 
@@ -163,17 +163,21 @@ local contrast leaves coloured parts, such as Doppler flow, as they are.
 
 ### 3D
 
-![The 3D view of a vessel phantom, maximum intensity, hot iron](docs/3d.png)
+![The 3D view of a vessel phantom: blend with shading, hot iron](docs/3d.png)
 
-**3D** (or D) turns the series into a stack of its slices. The current slice
-tilts back and the others fan out behind it, spaced as the scanner recorded
-them. Dark parts are see-through and bright parts solid, so the window
-decides what you see: the bone window (3) shows the skeleton, the lung window
-(2) the lungs.
+**3D** (or D) shows the series as a solid volume. For every pixel of the
+view, the GPU follows a line of sight through the volume, sampling it all
+the way. Dark parts are see-through and bright parts solid, so the window
+decides what you see: the bone window (3) shows the skeleton, the lung
+window (2) the lungs. Light falls from the front, so surfaces show their
+shape.
+
+The volume grows out of the current slice as it turns into view, and
+folds back into it when you turn 3D off.
 
 | To                      | Mouse                                   |
 |-------------------------|-----------------------------------------|
-| Turn the stack          | Left-drag                               |
+| Turn the volume         | Left-drag                               |
 | Change window and level | Ctrl+drag (Cmd+drag on macOS)           |
 | Pan                     | Right-drag, middle-drag or Shift+drag   |
 | Zoom                    | Wheel, or pinch on a trackpad           |
@@ -184,16 +188,25 @@ The bottom bar holds the 3D settings:
 - **Blend** or **MIP**. MIP, maximum intensity projection, shows the
   brightest value along each line of sight. It is the usual way to show
   contrast-filled vessels in CT and MR angiography, and hot spots in PET.
-- **Opacity** sets how quickly bright parts block the view.
-- **Depth** stretches or squashes the gap between slices. Without slice
-  positions in the files, as in a cine loop, the stack is made half as deep
-  as it is wide.
-- **Full detail**, on by default, keeps every slice at full resolution. The
+- **Opacity** sets how quickly bright parts block the view. At 30, the
+  default, bone and contrast-filled vessels look solid; lower it to see
+  into them.
+- **Shade**, on by default, lights the volume from the front. Turn it off
+  for flat colour.
+- **Depth** stretches or squashes the volume's depth, the gap between
+  slices. Without slice positions in the files, as in a cine loop, the
+  volume is made half as deep as it is wide.
+- **Full detail**, on by default, keeps every slice at full resolution, up
+  to the largest 3D texture the GPU takes (usually 2048 pixels a side). The
   corner shows the size of the volume and the GPU memory it takes: 500 CT
   slices of 512 × 512 take about 250 MB. Turn it off on a GPU with little
-  memory, or when turning the stack is slow: the view then uses at most 256
-  slices (every second or third slice of a longer series) of at most 512
-  pixels across.
+  memory, or when turning is slow: the view then uses at most 256 slices
+  (every second or third slice of a longer series) of at most 512 pixels
+  across.
+
+While you turn, pan or zoom, the view draws at half resolution with half
+the samples, and sharpens a moment after you stop. A view that has not
+changed is not drawn again.
 
 If the GPU cannot hold the volume, the 3D view closes and the status line
 says why, so you can turn off Full detail and try again.
@@ -242,8 +255,9 @@ example `QUICK_DICOM_CACHE_MB=8000 quick_dicom /scans`.
   H.264 patent royalties only for the OpenH264 binaries it distributes itself,
   so that cover does not extend to these builds. This rarely matters for
   personal use; check before you distribute builds.
-- The 3D view is a stack of slices, not a reconstruction: seen almost edge-on,
-  the gaps between slices show. Videos always show the 2D slices.
+- The 3D view has no tools to cut parts away: to see past bone, narrow the
+  window or use MIP. With thick slices, smooth surfaces show faint steps
+  where the slices were. Videos always show the 2D slices.
 
 ## How it works
 
@@ -257,8 +271,8 @@ example `QUICK_DICOM_CACHE_MB=8000 quick_dicom /scans`.
 | `src/export.rs`    | Draws each frame with the current window into YUV, as the shader would, and encodes it with OpenH264 on a background thread.                                |
 | `src/mp4.rs`       | Writes the H.264 frames into an MP4 file, with the index before the data so playback can start before the file has loaded.                                   |
 | `src/volume.rs`    | Builds the 3D volume in the background: decodes every slice, keeps raw values as 16-bit floats, and works out the gap between slices from their positions.  |
-| `src/render3d.rs`  | Splits the volume across as many GPU texture arrays as it needs, draws the slices far to near into an offscreen image, then puts that image on screen.      |
-| `src/volume.wgsl`  | The 3D shaders: places each slice, applies window and colour map, and makes dark parts clear and bright parts solid.                                        |
+| `src/render3d.rs`  | Puts the volume on the GPU as one 3D texture, casts the rays into an offscreen image when the view changes, then puts that image on screen.                  |
+| `src/volume.wgsl`  | The 3D shaders: marches each ray through the volume front to back, applying window, colour map, opacity and lighting, or keeps the brightest value for MIP.  |
 | `src/colormap.rs`  | The colour maps, with twins in `src/common.wgsl` for the GPU.                                                                                               |
 | `src/filter.rs`    | Denoising and sharpening: measures each image's noise, runs the GPU passes, and does the same on the CPU for videos.                                        |
 | `src/filter.wgsl`  | The filter shaders: a bilateral filter, then a Gaussian blur across and down and the image plus the detail the blur removed.                                |

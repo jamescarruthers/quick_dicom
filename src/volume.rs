@@ -42,6 +42,24 @@ pub struct Volume {
 }
 
 impl Volume {
+    /// A volume made from raw values, layer after layer, for tests.
+    #[cfg(test)]
+    pub fn from_values(width: u32, height: u32, depth: u32, values: &[f32]) -> Self {
+        Volume {
+            key: String::new(),
+            full: true,
+            width,
+            height,
+            depth,
+            voxels: Mutex::new(values.iter().map(|&v| f16_bits(v)).collect()),
+            slice_gap: Some(1.0),
+            stride: 1,
+            window: (0.5, 1.0),
+            inverted: false,
+            failed: 0,
+        }
+    }
+
     /// Size on the GPU.
     pub fn bytes(&self) -> u64 {
         self.width as u64 * self.height as u64 * self.depth as u64 * 2
@@ -53,13 +71,15 @@ impl Volume {
     }
 }
 
-/// Every how many frames a slice is taken: all of them at full detail.
-fn stride_for(frames: usize, full: bool) -> usize {
-    if full {
-        1
+/// Every how many frames a slice is taken: all of them at full detail, as
+/// far as the GPU's `max_layers` allows.
+fn stride_for(frames: usize, full: bool, max_layers: usize) -> usize {
+    let layers = if full {
+        max_layers
     } else {
-        frames.div_ceil(FAST_LAYERS).max(1)
-    }
+        FAST_LAYERS.min(max_layers)
+    };
+    frames.div_ceil(layers.max(1)).max(1)
 }
 
 /// A volume being built on a background thread. Dropping it cancels.
@@ -79,10 +99,10 @@ impl Drop for VolumeJob {
 }
 
 impl VolumeJob {
-    /// `max_side` is the largest texture side the GPU takes; full detail
-    /// keeps slices as large as that.
+    /// `max_side` is the largest 3D texture the GPU takes along any side;
+    /// full detail keeps the volume as large as that.
     pub fn start(stack: &Stack, full: bool, max_side: u32, ctx: eframe::egui::Context) -> Self {
-        let stride = stride_for(stack.frames.len(), full);
+        let stride = stride_for(stack.frames.len(), full, max_side as usize);
         let side = if full {
             max_side
         } else {
@@ -289,10 +309,13 @@ mod tests {
 
     #[test]
     fn full_detail_keeps_every_slice() {
-        assert_eq!(stride_for(1000, true), 1);
-        assert_eq!(stride_for(1000, false), 4);
-        assert_eq!(stride_for(256, false), 1);
-        assert_eq!(stride_for(257, false), 2);
+        assert_eq!(stride_for(1000, true, 2048), 1);
+        assert_eq!(stride_for(1000, false, 2048), 4);
+        assert_eq!(stride_for(256, false, 2048), 1);
+        assert_eq!(stride_for(257, false, 2048), 2);
+        // Only as many slices as the GPU's 3D textures take.
+        assert_eq!(stride_for(3000, true, 2048), 2);
+        assert_eq!(stride_for(300, false, 128), 3);
     }
 
     #[test]
