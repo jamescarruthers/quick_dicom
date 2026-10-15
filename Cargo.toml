@@ -26,9 +26,20 @@ pollster = "0.4"
 rayon = "1.12.0"
 rfd = "0.17.2"
 serde_json = "1"
+# Checks downloaded model weights.
+sha2 = "0.10"
 # HTTP to a MONAI Label server, with TLS for remote ones.
 ureq = "3"
 walkdir = "2.5.0"
+
+# Runs the built-in AI models on the CPU. There is no ONNX Runtime build for
+# Intel Macs; they use the GPU instead.
+[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
+ort = { version = "=2.0.0-rc.14", default-features = false, features = [
+    "std",
+    "download-binaries",
+    "tls-rustls",
+] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }

@@ -8,6 +8,7 @@ use eframe::egui::{
 };
 use eframe::egui_wgpu;
 
+use crate::ai;
 use crate::colormap::Colormap;
 use crate::decode::{Frame, Spacing};
 use crate::export::{self, Export};
@@ -125,6 +126,9 @@ struct Monai {
     model: usize,
     error: Option<String>,
     job: Option<Segmenting>,
+    /// The built-in model picked, from `ai::MODELS`.
+    builtin: usize,
+    builtin_job: Option<ai::Job>,
     result: Option<Arc<Segmentation>>,
     /// Lay the labels over the images and colour them in 3D.
     show: bool,
@@ -141,6 +145,8 @@ impl Default for Monai {
             model: 0,
             error: None,
             job: None,
+            builtin: 0,
+            builtin_job: None,
             result: None,
             show: true,
         }
@@ -772,7 +778,7 @@ impl ViewerApp {
                      window and level, wheel to zoom.",
                 );
             });
-            self.monai_menu(ui);
+            self.ai_menu(ui);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 // Long messages are cut to fit; egui shows the whole text on hover.
                 ui.add(egui::Label::new(&self.status).truncate());
@@ -891,17 +897,42 @@ impl ViewerApp {
                 None => self.status = job.stage(),
             }
         }
+        if let Some(job) = &m.builtin_job {
+            match job.poll() {
+                Some(Ok((seg, seconds))) => {
+                    self.status = match seg.found.len() {
+                        0 => format!(
+                            "{} found nothing in this series ({seconds:.0} s)",
+                            seg.model
+                        ),
+                        1 => format!("{}: 1 structure found in {seconds:.0} s", seg.model),
+                        n => format!("{}: {n} structures found in {seconds:.0} s", seg.model),
+                    };
+                    m.result = Some(Arc::new(seg));
+                    m.show = true;
+                    m.builtin_job = None;
+                }
+                Some(Err(e)) => {
+                    if e != "cancelled" {
+                        self.status = format!("Segmentation failed: {e}");
+                    }
+                    m.builtin_job = None;
+                }
+                None => self.status = job.stage(),
+            }
+        }
         if let Some(n) = self.gpu_notice.lock().unwrap().take() {
             self.status = format!("3D view without labels: {n}");
         }
     }
 
-    /// Connect to a MONAI Label server, pick a model, and segment the
-    /// selected series with it.
-    fn monai_menu(&mut self, ui: &mut egui::Ui) {
+    /// Segment the selected series with a built-in model or one on a
+    /// MONAI Label server, and show what it found.
+    fn ai_menu(&mut self, ui: &mut egui::Ui) {
         let stack = self.stack().cloned();
         let shown = self.labels().is_some();
-        let button = egui::Button::new("MONAI").selected(shown || self.monai.job.is_some());
+        let busy = self.monai.job.is_some() || self.monai.builtin_job.is_some();
+        let button = egui::Button::new("AI").selected(shown || busy);
         let config = egui::containers::menu::MenuConfig::new()
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
         egui::containers::menu::MenuButton::from_button(button)
@@ -909,75 +940,50 @@ impl ViewerApp {
             .ui(ui, |ui| {
                 ui.set_max_width(420.0);
                 let m = &mut self.monai;
-                ui.horizontal(|ui| {
-                    ui.label("Server");
-                    ui.add(egui::TextEdit::singleline(&mut m.server).desired_width(220.0));
-                    let busy = m.connecting.is_some();
-                    if ui.add_enabled(!busy, egui::Button::new("Connect")).clicked() {
-                        m.connecting = Some(Connecting::start(m.server.trim().to_string(), ui.ctx().clone()));
-                        m.error = None;
-                    }
-                    if busy {
-                        ui.spinner();
-                    }
-                });
-                if let Some(e) = &m.error {
-                    ui.colored_label(Color32::from_rgb(255, 140, 120), e);
-                }
-                if m.connected.is_none() {
-                    ui.weak(
-                        "Run a MONAI Label server, here or on a machine with a GPU, \
-                         then connect to it. For example:",
-                    );
-                    // Read-only, so the command can be selected and copied.
-                    let mut command = "monailabel start_server --app apps/radiology \\\n  --studies data --conf models segmentation";
-                    ui.add(
-                        egui::TextEdit::multiline(&mut command)
-                            .code_editor()
-                            .desired_rows(2)
-                            .desired_width(f32::INFINITY),
-                    );
-                    return;
-                }
-                ui.separator();
-                for (i, model) in m.models.iter().enumerate() {
-                    let text = match model.labels.len() {
-                        1 => format!("{}  (1 label)", model.name),
-                        n => format!("{}  ({n} labels)", model.name),
+                ui.strong("Built-in models");
+                for (i, model) in ai::MODELS.iter().enumerate() {
+                    let text = if model.downloaded() {
+                        model.name.to_string()
+                    } else {
+                        format!("{}  ({} MB download)", model.name, model.megabytes)
                     };
-                    ui.radio_value(&mut m.model, i, text).on_hover_text(&model.description);
+                    ui.radio_value(&mut m.builtin, i, text)
+                        .on_hover_text(model.about);
                 }
-                ui.separator();
-                match (&m.job, &stack) {
+                match (&m.builtin_job, &stack) {
                     (Some(job), _) => {
                         ui.horizontal(|ui| {
                             ui.spinner();
                             ui.add(egui::Label::new(job.stage()).wrap());
                         });
-                        if ui.button("Stop waiting").clicked() {
-                            m.job = None;
-                            self.status = "Stopped waiting for the server".into();
+                        if ui.button("Stop").clicked() {
+                            m.builtin_job = None;
+                            self.status = "Segmentation stopped".into();
                         }
                     }
                     (None, Some(stack)) => {
-                        let model = m.models.get(m.model).cloned();
-                        let server = m.connected.clone().unwrap_or_default();
                         if ui
-                            .add_enabled(model.is_some(), egui::Button::new("Segment this series"))
+                            .button("Segment this series")
                             .on_hover_text(
-                                "Send the whole series to the server and show the labels it \
-                                 finds. Models take seconds on a GPU, minutes on a CPU.",
+                                "Run the model on this computer. The first run downloads it \
+                                 from MONAI's page on Hugging Face.",
                             )
                             .clicked()
-                            && let Some(model) = model
                         {
-                            m.job = Some(Segmenting::start(stack, server, model, ui.ctx().clone()));
+                            let model = &ai::MODELS[m.builtin];
+                            m.builtin_job = Some(ai::Job::start(stack, model, ui.ctx().clone()));
                         }
                     }
                     (None, None) => {
                         ui.weak("Select a series to segment.");
                     }
                 }
+                ui.separator();
+                egui::CollapsingHeader::new("MONAI Label server")
+                    .default_open(m.connected.is_some())
+                    .show(ui, |ui| {
+                        Self::server_section(m, ui, stack.as_deref(), &mut self.status);
+                    });
                 let Some(seg) = m.result.clone() else {
                     return;
                 };
@@ -990,25 +996,116 @@ impl ViewerApp {
                     }
                 });
                 if stack.as_ref().is_none_or(|s| s.key != seg.key) {
-                    ui.weak(format!("The labels from {} belong to another series.", seg.model));
+                    ui.weak(format!(
+                        "The labels from {} belong to another series.",
+                        seg.model
+                    ));
                     return;
                 }
-                egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                    for &id in &seg.found {
-                        let [r, g, b] = crate::colormap::label_colour(id).map(|c| (c * 255.0) as u8);
-                        ui.horizontal(|ui| {
-                            let (swatch, _) = ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
-                            ui.painter().rect_filled(swatch, 2.0, Color32::from_rgb(r, g, b));
-                            ui.label(seg.name(id));
-                        });
-                    }
-                    if seg.found.is_empty() {
-                        ui.weak("No labels were found in this series.");
-                    }
-                });
+                egui::ScrollArea::vertical()
+                    .min_scrolled_height(200.0)
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for &id in &seg.found {
+                            let [r, g, b] =
+                                crate::colormap::label_colour(id).map(|c| (c * 255.0) as u8);
+                            ui.horizontal(|ui| {
+                                let (swatch, _) =
+                                    ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
+                                ui.painter()
+                                    .rect_filled(swatch, 2.0, Color32::from_rgb(r, g, b));
+                                ui.label(seg.name(id));
+                            });
+                        }
+                        if seg.found.is_empty() {
+                            ui.weak("No labels were found in this series.");
+                        }
+                    });
             })
             .0
-            .on_hover_text("Segment the series with an AI model on a MONAI Label server");
+            .on_hover_text("Segment the series with an AI model");
+    }
+
+    /// Connect to a MONAI Label server, pick one of its models, and send it
+    /// the series.
+    fn server_section(
+        m: &mut Monai,
+        ui: &mut egui::Ui,
+        stack: Option<&Stack>,
+        status: &mut String,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label("Server");
+            ui.add(egui::TextEdit::singleline(&mut m.server).desired_width(220.0));
+            let busy = m.connecting.is_some();
+            if ui
+                .add_enabled(!busy, egui::Button::new("Connect"))
+                .clicked()
+            {
+                m.connecting = Some(Connecting::start(
+                    m.server.trim().to_string(),
+                    ui.ctx().clone(),
+                ));
+                m.error = None;
+            }
+            if busy {
+                ui.spinner();
+            }
+        });
+        if let Some(e) = &m.error {
+            ui.colored_label(Color32::from_rgb(255, 140, 120), e);
+        }
+        if m.connected.is_none() {
+            ui.weak(
+                "For other models, or a GPU on another machine, run a MONAI Label \
+                 server and connect to it. For example:",
+            );
+            // Read-only, so the command can be selected and copied.
+            let mut command = "monailabel start_server --app apps/radiology \\\n  --studies data --conf models segmentation";
+            ui.add(
+                egui::TextEdit::multiline(&mut command)
+                    .code_editor()
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY),
+            );
+            return;
+        }
+        for (i, model) in m.models.iter().enumerate() {
+            let text = match model.labels.len() {
+                1 => format!("{}  (1 label)", model.name),
+                n => format!("{}  ({n} labels)", model.name),
+            };
+            ui.radio_value(&mut m.model, i, text)
+                .on_hover_text(&model.description);
+        }
+        match (&m.job, stack) {
+            (Some(job), _) => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.add(egui::Label::new(job.stage()).wrap());
+                });
+                if ui.button("Stop waiting").clicked() {
+                    m.job = None;
+                    *status = "Stopped waiting for the server".into();
+                }
+            }
+            (None, Some(stack)) => {
+                let model = m.models.get(m.model).cloned();
+                let server = m.connected.clone().unwrap_or_default();
+                if ui
+                    .add_enabled(model.is_some(), egui::Button::new("Send this series"))
+                    .on_hover_text(
+                        "Send the whole series to the server and show the labels it \
+                         finds. Models take seconds on a GPU, minutes on a CPU.",
+                    )
+                    .clicked()
+                    && let Some(model) = model
+                {
+                    m.job = Some(Segmenting::start(stack, server, model, ui.ctx().clone()));
+                }
+            }
+            (None, None) => {}
+        }
     }
 
     fn bottom_bar(&mut self, ui: &mut egui::Ui) {

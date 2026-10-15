@@ -25,8 +25,9 @@ you scrub through each series or cine loop.
   each image's own noise.
 - Shows a series as a 3D volume, ray cast on the GPU with lighting and dark
   parts see-through, or as a maximum intensity projection.
-- Sends a series to a MONAI Label server for AI segmentation, and outlines
-  the organs it finds on each slice and colours them in 3D.
+- Finds organs, bones and vessels in CT with MONAI's AI models, built in or
+  on a MONAI Label server, and outlines them on each slice and colours them
+  in 3D.
 
 ## Get it
 
@@ -80,7 +81,7 @@ quick_dicom image.dcm       # open the file's folder and select that image
 | Change the colour map   | Colour menu in the toolbar              | C                        |
 | Show or hide rulers     | Rulers button                           | M                        |
 | Switch 3D on or off     | 3D button                               | D                        |
-| Show or hide AI labels  | MONAI menu in the toolbar               | G                        |
+| Show or hide AI labels  | AI menu in the toolbar                  | G                        |
 
 The CT presets are 1 soft tissue, 2 lung, 3 bone, 4 brain and 5 liver.
 
@@ -214,14 +215,57 @@ changed is not drawn again.
 If the GPU cannot hold the volume, the 3D view closes and the status line
 says why, so you can turn off Full detail and try again.
 
-### AI segmentation with MONAI Label
+### AI segmentation
 
-The **MONAI** menu sends the current series to a
-[MONAI Label](https://github.com/Project-MONAI/MONAILabel) server, which runs
-an AI model on it and sends back the structures it finds. The viewer then
-outlines each one, in its own colour, on every slice, and shows them solid
-in the 3D view, with the rest of the scan faint around them. The value
-under the pointer gains the name of the structure there.
+The **AI** menu runs an AI model on the current series and shows the
+structures it finds. The viewer outlines each one, in its own colour, on
+every slice, and shows them solid in the 3D view, with the rest of the scan
+faint around them. The value under the pointer gains the name of the
+structure there. **Show labels** (G) hides and shows them, and the menu
+lists the structures found, with their colours.
+
+#### Built-in models
+
+Three models from MONAI's model zoo run inside the viewer, with no Python
+and nothing to install. Pick one and click **Segment this series**:
+
+| Model                         | Finds                                                        | Download | Time on 4 CPU cores* |
+|-------------------------------|--------------------------------------------------------------|---------:|---------------------:|
+| Spleen                        | The spleen, in abdominal CT                                  | 19 MB    | 3 s                  |
+| Whole body, quick (3 mm)      | 104 organs, bones, muscles and vessels, in CT, at 3 mm       | 75 MB    | 10 s                 |
+| Whole body, detailed (1.5 mm) | The same 104 structures at 1.5 mm, with finer edges          | 75 MB    | 80 s                 |
+
+\* For a 38-slice abdominal CT, 512 × 512 pixels a slice.
+
+The first run of each model downloads its weights from
+[MONAI's page on Hugging Face](https://huggingface.co/MONAI), checks them
+against a fixed SHA-256, and keeps them in the cache folder
+(`~/.cache/quick_dicom/models` on Linux, `~/Library/Caches/quick_dicom/models`
+on macOS, `%LOCALAPPDATA%\quick_dicom\models` on Windows; set
+`QUICK_DICOM_MODELS` to use another). Later runs need no network. The
+series never leaves the computer.
+
+The viewer reads the PyTorch weights itself, rebuilds MONAI's network, and
+runs it with [ONNX Runtime](https://onnxruntime.ai) on the CPU. It prepares
+the scan as MONAI's own code does: it turns it to the patient's axes,
+resamples it to the model's voxel size, scales its values, runs the model on
+overlapping 96-voxel cubes and blends them. On a real CT its labels match
+MONAI's own output voxel for voxel for the spleen and the quick model, and
+to a Dice score of 0.997 for the detailed one, which keeps only each voxel's
+four best classes to save memory. Built-in models do not run on Intel Macs
+yet: ONNX Runtime publishes no build for them.
+
+The weights are MONAI's (Apache 2.0). The spleen model learned from the
+[Medical Segmentation Decathlon](http://medicaldecathlon.com/) (CC BY-SA
+4.0), the whole-body models from
+[TotalSegmentator](https://zenodo.org/record/6802614) (CC BY 4.0).
+
+#### MONAI Label server
+
+For other models, or to use a GPU on another machine, open **MONAI Label
+server** in the same menu. It sends the series to a
+[MONAI Label](https://github.com/Project-MONAI/MONAILabel) server, which
+runs the model and sends back the labels.
 
 MONAI Label is a free server from Project MONAI, written in Python. It runs
 on Windows, macOS and Linux, on the CPU or, much faster, on an NVIDIA GPU.
@@ -245,12 +289,10 @@ sends the images itself. Useful models in the radiology app:
 
 Several can run at once: `--conf models segmentation,segmentation_spleen`.
 
-In the viewer, open **MONAI**, check the address (`http://127.0.0.1:8000`
-for a server on the same machine), click **Connect**, pick a model and
-click **Segment this series**. A model takes seconds on a GPU and up to a
-few minutes on a CPU; the status line shows how it is going. **Show
-labels** (G) hides and shows the result, and the menu lists the structures
-found, with their colours.
+In the viewer, check the address (`http://127.0.0.1:8000` for a server on
+the same machine), click **Connect**, pick a model and click **Send this
+series**. A model takes seconds on a GPU and up to a few minutes on a CPU;
+the status line shows how it is going.
 
 To use a server on another machine, start it with `--host 0.0.0.0` and
 connect to that machine's address. Set `QUICK_DICOM_MONAI` to change the
@@ -312,7 +354,7 @@ example `QUICK_DICOM_CACHE_MB=8000 quick_dicom /scans`.
 - AI labels stay only while the viewer runs, one series at a time. Videos
   and MIP leave them out. Colour series cannot be segmented. The MONAI
   models are research tools, not cleared for diagnosis, and work best on
-  the kind of scan they learned from (most of the radiology app's on CT).
+  the kind of scan they learned from: CT, for all the built-in ones.
 
 ## How it works
 
@@ -328,6 +370,7 @@ example `QUICK_DICOM_CACHE_MB=8000 quick_dicom /scans`.
 | `src/volume.rs`    | Builds the 3D volume in the background: decodes every slice, keeps raw values as 16-bit floats, and works out the gap between slices from their positions.  |
 | `src/render3d.rs`  | Puts the volume on the GPU as one 3D texture, casts the rays into an offscreen image when the view changes, then puts that image on screen.                  |
 | `src/volume.wgsl`  | The 3D shaders: marches each ray through the volume front to back, applying window, colour map, opacity and lighting, or keeps the brightest value for MIP. Colours AI labels. |
+| `src/ai/`          | The built-in models: `torch.rs` reads PyTorch weights, `net.rs` rebuilds MONAI's UNet and SegResNet, `onnx.rs` and `ort_cpu.rs` run them with ONNX Runtime, `pipeline.rs` prepares the scan and blends the cubes, `mod.rs` lists the models and downloads them. |
 | `src/monai.rs`     | Talks to a MONAI Label server on a background thread: lists its models, reads the series at full resolution, sends it, and reads back the labels.           |
 | `src/nifti.rs`     | Writes the series as a NIfTI volume, with its position in the patient taken from the DICOM slice positions, and reads the labels the server returns.       |
 | `src/colormap.rs`  | The colour maps, with twins in `src/common.wgsl` for the GPU.                                                                                               |
