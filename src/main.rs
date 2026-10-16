@@ -16,6 +16,7 @@ mod nifti;
 mod render;
 mod render3d;
 mod scan;
+mod surface;
 #[cfg(test)]
 mod testing;
 mod volume;

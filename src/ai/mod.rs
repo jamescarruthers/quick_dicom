@@ -363,6 +363,25 @@ pub fn segment(
     Ok(pipeline::to_scan(&output, &grid, scan))
 }
 
+/// How many of the scan's voxels each of the model's spans, along each of
+/// the scan's axes: the size of the blocks its labels come back in. One
+/// where the labels come back smooth.
+fn blocks(scan: &crate::monai::Scan, model: &Model) -> [f32; 3] {
+    if model.recipe.smooth {
+        return [1.0; 3];
+    }
+    std::array::from_fn(|a| {
+        // The scan's axis in the patient's space, and the model's voxel
+        // measured along it.
+        let axis: [f64; 3] = std::array::from_fn(|b| scan.affine[b][a]);
+        let length = axis.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-9);
+        let along: f64 = (0..3)
+            .map(|b| (axis[b] / length).abs() * model.recipe.spacing[b])
+            .sum();
+        (along / length) as f32
+    })
+}
+
 /// A built-in model segmenting a stack on a background thread. Dropping it
 /// stops the work.
 pub struct Job {
@@ -427,12 +446,13 @@ impl Job {
                     let voxels = segment(&scan, model, engine.as_mut(), &c, &mut progress);
                     *last = Some((model.name, device, engine, place.clone()));
                     let seconds = start.elapsed().as_secs_f32();
-                    let seg = Segmentation::new(
+                    let seg = Segmentation::made_at(
                         key,
                         model.name.to_string(),
                         scan.dims,
                         voxels?,
                         model.names(),
+                        blocks(&scan, model),
                     );
                     Ok((seg, seconds, place))
                 })();
@@ -484,6 +504,30 @@ mod tests {
         }
         assert_eq!(WHOLE_BODY.len(), 105);
         assert_eq!(WHOLE_BODY[104], "urinary bladder");
+    }
+
+    /// The blocks labels come back in: a 3 mm model on 0.75 mm pixels and
+    /// 5 mm slices, rows running back to front, spans four pixels each way
+    /// and under one slice; a smooth recipe has none.
+    #[test]
+    fn blocks_follow_the_scan_axes() {
+        let scan = crate::monai::Scan {
+            dims: [4, 4, 4],
+            affine: [
+                [-0.75, 0.0, 0.0, 0.0],
+                [0.0, -0.75, 0.0, 0.0],
+                [0.0, 0.0, 5.0, 0.0],
+            ],
+            values: Vec::new(),
+        };
+        let b = blocks(&scan, &MODELS[1]);
+        assert!(
+            b.iter()
+                .zip([4.0, 4.0, 0.6])
+                .all(|(x, y)| (x - y).abs() < 1e-5),
+            "{b:?}"
+        );
+        assert_eq!(blocks(&scan, &MODELS[0]), [1.0; 3]);
     }
 
     /// The built-in models against MONAI's own bundle code on a real scan.

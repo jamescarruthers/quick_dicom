@@ -24,15 +24,23 @@ struct Uniforms {
     // Density, mode (0 blend, 1 maximum intensity), sRGB target, shading.
     look: vec4<f32>,
     // Segmentation labels shown (0 or 1), every how many label slices the
-    // volume took one, unused, unused.
+    // volume took one, a version of which labels are hidden, and flags:
+    // 1 for smooth surfaces, 2 for labels above 255.
     labels: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var volume: texture_3d<f32>;
 @group(0) @binding(2) var volume_sampler: sampler;
-// Segmentation labels at the scan's full resolution, 0 for none.
+// Segmentation labels at the scan's full resolution, 0 for none, each
+// with three distances across its slice, in eighths of a pixel up to FAR:
+// inside its own region, from the structure in the voxel above, and from
+// the one below, where those differ (see `surface.rs`). One byte each
+// when labels fit in a byte; else the label and the first distance in
+// the first word, 16 bits each, the others in the second.
 @group(1) @binding(0) var label_map: texture_3d<u32>;
+// Which labels are shown: label l at (l % 256, l / 256), 0 for hidden.
+@group(1) @binding(1) var label_shown: texture_2d<u32>;
 
 struct RayIn {
     @builtin(position) pos: vec4<f32>,
@@ -66,36 +74,228 @@ fn value(p: vec3<f32>) -> f32 {
     return textureSampleLevel(volume, volume_sampler, to_texture(p), 0.0).r;
 }
 
-// The label at a model point: the labels cover the same box as the
-// volume, at their own resolution, and the volume may hold only every
-// so many of their slices.
-fn label_at(p: vec3<f32>) -> u32 {
-    let size = vec3<i32>(textureDimensions(label_map));
+// Twenty-four pixels, as far as distances go (`surface::FAR`).
+const FAR: u32 = 192u;
+// A smooth surface's slope is measured this many label pixels each way:
+// enough to even out the pixel steps in each slice's outline.
+const SLOPE_REACH: f32 = 4.0;
+
+// The labels cover the same box as the volume, at their own resolution,
+// and the volume may hold only every so many of their slices. This is a
+// model point's place among the label voxels, with voxel centres at whole
+// numbers: x, y and slice.
+fn label_grid(p: vec3<f32>) -> vec3<f32> {
+    let size = vec3<f32>(textureDimensions(label_map));
     let tex = to_texture(p);
     let layer = tex.z * u.dims.z - 0.5;
-    let q = vec3<i32>(
-        i32(floor(tex.x * f32(size.x))),
-        i32(floor(tex.y * f32(size.y))),
-        i32(round(layer * u.labels.y)),
-    );
-    if any(q < vec3<i32>(0)) || any(q >= size) {
-        return 0u;
-    }
-    return textureLoad(label_map, q, 0).r;
+    return vec3<f32>(tex.x * size.x - 0.5, tex.y * size.y - 0.5, layer * u.labels.y);
 }
 
-fn inside(p: vec3<f32>, id: u32) -> f32 {
-    return select(0.0, 1.0, label_at(p) == id);
+fn smooth_surfaces() -> bool {
+    return (u32(u.labels.w) & 1u) != 0u;
+}
+
+struct Voxel {
+    id: u32,
+    // Inside its own region, from the structure above, from the one below.
+    d: vec3<f32>,
+}
+
+// A label voxel; beyond the labels, background far from anything.
+fn label_voxel(q: vec3<i32>) -> Voxel {
+    let size = vec3<i32>(textureDimensions(label_map));
+    if any(q < vec3<i32>(0)) || any(q >= size) {
+        return Voxel(0u, vec3<f32>(f32(FAR), 0.0, 0.0));
+    }
+    let v = textureLoad(label_map, q, 0);
+    if (u32(u.labels.w) & 2u) != 0u {
+        let d = vec3<u32>(v.x >> 16u, v.y & 0xffu, (v.y >> 8u) & 0xffu);
+        return Voxel(v.x & 0xffffu, vec3<f32>(d));
+    }
+    let d = vec3<u32>(v.x >> 8u, v.x >> 16u, v.x >> 24u) & vec3<u32>(0xffu);
+    return Voxel(v.x & 0xffu, vec3<f32>(d));
+}
+
+fn shows(id: u32) -> bool {
+    return textureLoad(label_shown, vec2<i32>(i32(id % 256u), i32(id / 256u)), 0).r != 0u;
+}
+
+struct Smooth {
+    id: u32,
+    inside: f32,
+}
+
+// The eight label voxels round a grid point, lower slice first, x
+// fastest, with their trilinear weights. No arrays: Direct3D's FXC
+// compiler cannot index local arrays at run time.
+struct Corners {
+    v0: Voxel,
+    v1: Voxel,
+    v2: Voxel,
+    v3: Voxel,
+    v4: Voxel,
+    v5: Voxel,
+    v6: Voxel,
+    v7: Voxel,
+    // The weights of the lower slice's four, then the upper's.
+    lower: vec4<f32>,
+    upper: vec4<f32>,
+}
+
+fn corners(g: vec3<f32>) -> Corners {
+    let b = floor(g);
+    let f = g - b;
+    let q = vec3<i32>(b);
+    let across = vec4<f32>(
+        (1.0 - f.x) * (1.0 - f.y),
+        f.x * (1.0 - f.y),
+        (1.0 - f.x) * f.y,
+        f.x * f.y,
+    );
+    return Corners(
+        label_voxel(q),
+        label_voxel(q + vec3<i32>(1, 0, 0)),
+        label_voxel(q + vec3<i32>(0, 1, 0)),
+        label_voxel(q + vec3<i32>(1, 1, 0)),
+        label_voxel(q + vec3<i32>(0, 0, 1)),
+        label_voxel(q + vec3<i32>(1, 0, 1)),
+        label_voxel(q + vec3<i32>(0, 1, 1)),
+        label_voxel(q + vec3<i32>(1, 1, 1)),
+        across * (1.0 - f.z),
+        across * f.z,
+    );
+}
+
+// One voxel's part in how far inside label a a point lies: its distance
+// inside its own label; for the label of the voxel across the slab from
+// it, `partner`, its distance from that, `from_partner`; for any other,
+// its distance inside its own region, against.
+fn part(v: Voxel, partner: u32, from_partner: f32, a: u32) -> f32 {
+    if v.id == a {
+        return v.d.x;
+    }
+    if partner == a {
+        return -from_partner;
+    }
+    return -v.d.x;
+}
+
+// How far inside label a a point lies, from its eight voxels. The lower
+// slice's partners are above them, the upper's below.
+fn inside_corners(c: Corners, a: u32) -> f32 {
+    let lower = vec4<f32>(
+        part(c.v0, c.v4.id, c.v0.d.y, a),
+        part(c.v1, c.v5.id, c.v1.d.y, a),
+        part(c.v2, c.v6.id, c.v2.d.y, a),
+        part(c.v3, c.v7.id, c.v3.d.y, a),
+    );
+    let upper = vec4<f32>(
+        part(c.v4, c.v0.id, c.v4.d.z, a),
+        part(c.v5, c.v1.id, c.v5.d.z, a),
+        part(c.v6, c.v2.id, c.v6.d.z, a),
+        part(c.v7, c.v3.id, c.v7.d.z, a),
+    );
+    return dot(lower, c.lower) + dot(upper, c.upper);
+}
+
+// The better of `best` and label a. A label met twice sums the same and
+// does not replace itself.
+fn better(c: Corners, a: u32, best: Smooth) -> Smooth {
+    if a == 0u {
+        return best;
+    }
+    let inside = inside_corners(c, a);
+    if inside > best.inside {
+        return Smooth(a, inside);
+    }
+    return best;
+}
+
+// The label whose smooth surface holds label grid point g, and how far
+// inside it g lies; or 0. Each of the eight voxels round g counts its
+// distance for its own label and against every other, weighted as in
+// trilinear interpolation, and the label with the largest sum wins if
+// the sum is positive. `surface::smooth_label` does the same on the CPU.
+fn smooth_label(g: vec3<f32>) -> Smooth {
+    let c = corners(g);
+    // Most points lie among voxels of one label, or none.
+    let first = vec4<u32>(c.v0.id);
+    let lower = vec4<u32>(c.v0.id, c.v1.id, c.v2.id, c.v3.id);
+    let upper = vec4<u32>(c.v4.id, c.v5.id, c.v6.id, c.v7.id);
+    if all(lower == first) && all(upper == first) {
+        if c.v0.id == 0u {
+            return Smooth(0u, -1.0);
+        }
+        return Smooth(c.v0.id, inside_corners(c, c.v0.id));
+    }
+    var best = Smooth(0u, -1e30);
+    best = better(c, c.v0.id, best);
+    best = better(c, c.v1.id, best);
+    best = better(c, c.v2.id, best);
+    best = better(c, c.v3.id, best);
+    best = better(c, c.v4.id, best);
+    best = better(c, c.v5.id, best);
+    best = better(c, c.v6.id, best);
+    best = better(c, c.v7.id, best);
+    if best.inside <= 0.0 {
+        best.id = 0u;
+    }
+    return best;
+}
+
+// The label at a model point, or 0 where there is none or it is hidden:
+// with smooth surfaces, the one whose surface holds the point, else the
+// nearest voxel's.
+fn label_at(p: vec3<f32>) -> u32 {
+    let g = label_grid(p);
+    var id: u32;
+    if smooth_surfaces() {
+        id = smooth_label(g).id;
+    } else {
+        id = label_voxel(vec3<i32>(floor(g + 0.5))).id;
+    }
+    return select(0u, id, shows(id));
+}
+
+// How far inside a label a point lies, for the slope of its surface:
+// with smooth surfaces the blended distance, else 1 inside and 0 out.
+fn label_depth(p: vec3<f32>, id: u32) -> f32 {
+    let g = label_grid(p);
+    if smooth_surfaces() {
+        return inside_corners(corners(g), id);
+    }
+    return select(0.0, 1.0, label_voxel(vec3<i32>(floor(g + 0.5))).id == id);
+}
+
+// Where a ray, outside label `id` at distance a and inside it at b, meets
+// its smooth surface, found by halving the gap.
+fn surface_point(origin: vec3<f32>, dir: vec3<f32>, a: f32, b: f32, id: u32) -> vec3<f32> {
+    var lo = a;
+    var hi = b;
+    for (var j = 0; j < 5; j++) {
+        let mid = 0.5 * (lo + hi);
+        if label_depth(origin + dir * mid, id) > 0.0 {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    return origin + dir * hi;
 }
 
 // Light on a labelled region, from the slope of the region's own edge, so
 // organs show their shape whatever the scan looks like there.
 fn lit_label(c: vec3<f32>, p: vec3<f32>, dir: vec3<f32>, id: u32) -> vec3<f32> {
-    let e = vec3<f32>(1.5, 1.5, 1.5 * gap());
+    var e = vec3<f32>(1.5, 1.5, 1.5 * gap());
+    if smooth_surfaces() {
+        // SLOPE_REACH label pixels across, a label slice deep.
+        let size = vec2<f32>(textureDimensions(label_map).xy);
+        e = vec3<f32>(SLOPE_REACH * u.dims.xy / size, gap() / u.labels.y);
+    }
     let grad = vec3<f32>(
-        inside(p + vec3<f32>(e.x, 0.0, 0.0), id) - inside(p - vec3<f32>(e.x, 0.0, 0.0), id),
-        inside(p + vec3<f32>(0.0, e.y, 0.0), id) - inside(p - vec3<f32>(0.0, e.y, 0.0), id),
-        inside(p + vec3<f32>(0.0, 0.0, e.z), id) - inside(p - vec3<f32>(0.0, 0.0, e.z), id),
+        label_depth(p + vec3<f32>(e.x, 0.0, 0.0), id) - label_depth(p - vec3<f32>(e.x, 0.0, 0.0), id),
+        label_depth(p + vec3<f32>(0.0, e.y, 0.0), id) - label_depth(p - vec3<f32>(0.0, e.y, 0.0), id),
+        label_depth(p + vec3<f32>(0.0, 0.0, e.z), id) - label_depth(p - vec3<f32>(0.0, 0.0, e.z), id),
     ) / e;
     let size = length(grad);
     if size < 1e-6 {
@@ -213,6 +413,10 @@ fn fs_ray(in: RayIn) -> @location(0) vec4<f32> {
     var alpha = 0.0;
     var plane_left = plane_at < 1e29;
     let plane_colour = colormap(shown(plane), u.wl.w) * (1.0 - t);
+    // The label of the last sample, and the colour of the one the ray is
+    // in, lit where the ray entered it.
+    var last_id = 0u;
+    var label_lit = vec3<f32>(0.0);
     var s = near + step * jitter;
     for (var i = 0; i < count; i++) {
         if plane_left && s >= plane_at {
@@ -235,10 +439,20 @@ fn fs_ray(in: RayIn) -> @location(0) vec4<f32> {
         if opacity > 0.002 {
             var c: vec3<f32>;
             if id > 0u {
-                c = label_colour(id);
-                if u.look.w > 0.5 {
-                    c = lit_label(c, p, dir, id);
+                if id != last_id {
+                    label_lit = label_colour(id);
+                    if u.look.w > 0.5 {
+                        // A smooth surface is lit where the ray meets it,
+                        // not at the sample past it, so the light does
+                        // not vary with where the samples fall.
+                        var at = p;
+                        if smooth_surfaces() && i > 0 {
+                            at = surface_point(origin, dir, s - step, s, id);
+                        }
+                        label_lit = lit_label(label_lit, at, dir, id);
+                    }
                 }
+                c = label_lit;
             } else {
                 c = colormap(g, u.wl.w);
                 if u.look.w > 0.5 {
@@ -251,6 +465,7 @@ fn fs_ray(in: RayIn) -> @location(0) vec4<f32> {
                 break;
             }
         }
+        last_id = id;
         s += step;
     }
     if plane_left {

@@ -48,6 +48,29 @@ pub struct Segmentation {
     pub names: Vec<(u16, String)>,
     /// The labels that occur, in order.
     pub found: Vec<u16>,
+    /// What each label that occurs covers, in the same order.
+    pub structures: Vec<Structure>,
+    /// The labels with the steps of the model's blocks taken out, for
+    /// smooth surfaces in 3D; none when the model worked at the scan's
+    /// scale. See `surface::smooth_labels`.
+    pub smoothed: Option<Vec<u16>>,
+    /// How far each voxel lies inside its own region of those labels, and
+    /// from the structures above and below it, across its slice: what
+    /// smooths the surfaces in 3D. See `surface::distances`.
+    pub distances: Vec<[u8; 3]>,
+}
+
+/// Where one label lies.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Structure {
+    pub label: u16,
+    pub voxels: usize,
+    /// The structure's own voxel nearest its centre, as (x, y, slice):
+    /// where its name goes. A curved structure's centre may lie outside
+    /// it; this voxel never does.
+    pub anchor: [u32; 3],
+    /// The first and last slices it appears on.
+    pub slices: (u32, u32),
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -60,9 +83,26 @@ impl Segmentation {
         voxels: Vec<u16>,
         names: Vec<(u16, String)>,
     ) -> Self {
-        let mut seen = vec![false; 65536];
-        voxels.iter().for_each(|&v| seen[v as usize] = true);
-        let found = (1..65536).filter(|&v| seen[v]).map(|v| v as u16).collect();
+        Self::made_at(key, model, dims, voxels, names, [1.0; 3])
+    }
+
+    /// A segmentation from a model that made its labels in blocks of
+    /// `blocks` scan voxels along each axis.
+    pub fn made_at(
+        key: String,
+        model: String,
+        dims: [usize; 3],
+        voxels: Vec<u16>,
+        names: Vec<(u16, String)>,
+        blocks: [f32; 3],
+    ) -> Self {
+        let structures = structures(&voxels, dims);
+        let sigma = crate::surface::blur_for(blocks);
+        let smoothed = sigma
+            .iter()
+            .any(|&s| s > 0.0)
+            .then(|| crate::surface::smooth_labels(&voxels, dims, sigma));
+        let distances = crate::surface::distances(smoothed.as_deref().unwrap_or(&voxels), dims);
         Segmentation {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             key,
@@ -72,7 +112,10 @@ impl Segmentation {
             depth: dims[2] as u32,
             voxels,
             names,
-            found,
+            found: structures.iter().map(|s| s.label).collect(),
+            structures,
+            smoothed,
+            distances,
         }
     }
 
@@ -95,9 +138,163 @@ impl Segmentation {
             .map_or_else(|| format!("label {label}"), |(_, n)| n.clone())
     }
 
+    /// The labels the 3D view's smooth surfaces follow.
+    pub fn surface_labels(&self) -> &[u16] {
+        self.smoothed.as_deref().unwrap_or(&self.voxels)
+    }
+
     /// The largest label, which decides how the GPU stores them.
     pub fn max_label(&self) -> u16 {
         self.found.last().copied().unwrap_or(0)
+    }
+}
+
+/// Each label's size, slices and anchor, from two passes over the voxels,
+/// slices in parallel.
+fn structures(voxels: &[u16], dims: [usize; 3]) -> Vec<Structure> {
+    let [w, h, d] = dims;
+    let plane = w * h;
+    if plane == 0 || d == 0 {
+        return Vec::new();
+    }
+    let top = voxels.par_iter().copied().max().unwrap_or(0) as usize;
+    if top == 0 {
+        return Vec::new();
+    }
+
+    // Counts, sums of positions and slice ranges.
+    #[derive(Clone, Copy)]
+    struct Sums {
+        n: usize,
+        x: f64,
+        y: f64,
+        z: f64,
+        first: u32,
+        last: u32,
+    }
+    let empty = Sums {
+        n: 0,
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+        first: u32::MAX,
+        last: 0,
+    };
+    let sums = voxels
+        .par_chunks(plane)
+        .enumerate()
+        .fold(
+            || vec![empty; top + 1],
+            |mut acc, (k, slice)| {
+                for (i, &v) in slice.iter().enumerate() {
+                    if v == 0 {
+                        continue;
+                    }
+                    let a = &mut acc[v as usize];
+                    a.n += 1;
+                    a.x += (i % w) as f64;
+                    a.y += (i / w) as f64;
+                    a.z += k as f64;
+                    a.first = a.first.min(k as u32);
+                    a.last = a.last.max(k as u32);
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![empty; top + 1],
+            |mut a, b| {
+                for (p, q) in a.iter_mut().zip(b) {
+                    p.n += q.n;
+                    p.x += q.x;
+                    p.y += q.y;
+                    p.z += q.z;
+                    p.first = p.first.min(q.first);
+                    p.last = p.last.max(q.last);
+                }
+                a
+            },
+        );
+    let centre: Vec<[f64; 3]> = sums
+        .iter()
+        .map(|s| {
+            let n = s.n.max(1) as f64;
+            [s.x / n, s.y / n, s.z / n]
+        })
+        .collect();
+
+    // The voxel of each label nearest its centre.
+    let nearest = voxels
+        .par_chunks(plane)
+        .enumerate()
+        .fold(
+            || vec![(f64::MAX, [0u32; 3]); top + 1],
+            |mut acc, (k, slice)| {
+                for (i, &v) in slice.iter().enumerate() {
+                    if v == 0 {
+                        continue;
+                    }
+                    let c = centre[v as usize];
+                    let p = [(i % w) as f64, (i / w) as f64, k as f64];
+                    let d2 = (p[0] - c[0]).powi(2) + (p[1] - c[1]).powi(2) + (p[2] - c[2]).powi(2);
+                    if d2 < acc[v as usize].0 {
+                        acc[v as usize] = (d2, [p[0] as u32, p[1] as u32, k as u32]);
+                    }
+                }
+                acc
+            },
+        )
+        .reduce(
+            || vec![(f64::MAX, [0u32; 3]); top + 1],
+            |mut a, b| {
+                for (p, q) in a.iter_mut().zip(b) {
+                    if q.0 < p.0 {
+                        *p = q;
+                    }
+                }
+                a
+            },
+        );
+    (1..=top)
+        .filter(|&l| sums[l].n > 0)
+        .map(|l| Structure {
+            label: l as u16,
+            voxels: sums[l].n,
+            anchor: nearest[l].1,
+            slices: (sums[l].first, sums[l].last),
+        })
+        .collect()
+}
+
+/// Which labels are shown: one byte per label, laid out as the shaders
+/// read it, 256 labels to a row.
+pub struct LabelMask {
+    /// Unique, so the GPU knows when to upload and redraw.
+    pub generation: u64,
+    shown: Vec<u8>,
+}
+
+impl LabelMask {
+    /// Every label shown but those in `hidden`.
+    pub fn hiding(hidden: &std::collections::BTreeSet<u16>) -> LabelMask {
+        let mut shown = vec![1u8; 65536];
+        shown[0] = 0;
+        for &l in hidden {
+            shown[l as usize] = 0;
+        }
+        LabelMask {
+            generation: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            shown,
+        }
+    }
+
+    pub fn shows(&self, label: u16) -> bool {
+        self.shown[label as usize] != 0
+    }
+
+    /// 256 × 256 bytes, row after row.
+    pub fn bytes(&self) -> &[u8] {
+        &self.shown
     }
 }
 
@@ -642,6 +839,49 @@ mod tests {
         assert_eq!(seg.slice(1), &[1, 0, 0, 3]);
         assert_eq!(seg.name(1), "liver");
         assert_eq!(seg.name(3), "label 3");
+        assert_eq!(
+            seg.structures[0],
+            Structure {
+                label: 1,
+                voxels: 1,
+                anchor: [0, 0, 1],
+                slices: (1, 1),
+            }
+        );
+        assert_eq!(seg.structures[1].voxels, 2);
+        assert_eq!(seg.structures[1].slices, (0, 1));
+    }
+
+    /// An arc's centre lies outside it; its name goes on its own voxel
+    /// nearest the centre.
+    #[test]
+    fn names_go_on_the_structure() {
+        let (w, h) = (9usize, 9usize);
+        let mut voxels = vec![0u16; w * h * 2];
+        // A U shape on slice 1: two arms and a base.
+        for y in 1..8 {
+            voxels[w * h + y * w + 1] = 4;
+            voxels[w * h + y * w + 7] = 4;
+        }
+        for x in 1..8 {
+            voxels[w * h + 7 * w + x] = 4;
+        }
+        let seg = Segmentation::new("k".into(), "m".into(), [w, h, 2], voxels, vec![]);
+        let s = &seg.structures[0];
+        assert_eq!(s.slices, (1, 1));
+        let [x, y, k] = s.anchor;
+        assert_eq!(seg.at(x, y, k), 4, "anchor {:?}", s.anchor);
+        // The centre is at (4, 5.1); the nearest voxel of the U is on its base.
+        assert_eq!(s.anchor, [4, 7, 1]);
+    }
+
+    #[test]
+    fn masks_hide_labels() {
+        let hidden = [3u16, 300].into_iter().collect();
+        let m = LabelMask::hiding(&hidden);
+        assert!(m.shows(1) && !m.shows(3) && !m.shows(300) && !m.shows(0));
+        assert_eq!(m.bytes().len(), 65536);
+        assert_ne!(LabelMask::hiding(&hidden).generation, m.generation);
     }
 }
 

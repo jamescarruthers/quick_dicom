@@ -19,6 +19,8 @@ struct Uniforms {
 @group(0) @binding(0) var<uniform> u: Uniforms;
 // One slice of segmentation labels, 0 for none.
 @group(1) @binding(0) var label_map: texture_2d<u32>;
+// Which labels are shown: label l at (l % 256, l / 256), 0 for hidden.
+@group(1) @binding(1) var label_shown: texture_2d<u32>;
 @group(0) @binding(1) var img: texture_2d<f32>;
 // Local contrast curves: one row of 256 per tile, row after row of tiles.
 @group(0) @binding(2) var curves: texture_2d<f32>;
@@ -57,12 +59,15 @@ fn bilinear(t: vec2<f32>) -> vec3<f32> {
     return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
 }
 
+// The label at q, or 0 where there is none or it is hidden.
 fn label_at(q: vec2<i32>) -> u32 {
     let size = vec2<i32>(u.labels.yz);
     if any(q < vec2<i32>(0)) || any(q >= size) {
         return 0u;
     }
-    return textureLoad(label_map, q, 0).r;
+    let id = textureLoad(label_map, q, 0).r;
+    let shown = textureLoad(label_shown, vec2<i32>(i32(id % 256u), i32(id / 256u)), 0).r;
+    return select(0u, id, shown != 0u);
 }
 
 // One tile's curve at brightness g, between its two nearest steps.
