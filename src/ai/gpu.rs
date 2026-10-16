@@ -12,10 +12,16 @@ const SOURCE: &str = include_str!("gpu.wgsl");
 
 /// The shared header of gpu.wgsl, then the section for `name`.
 fn source(name: &str) -> String {
-    let mut parts = SOURCE.split("//@ ");
+    section(SOURCE, name)
+}
+
+/// The header of `text`, then its section `name`. Lines may end in CRLF,
+/// as git checks files out on Windows.
+fn section(text: &str, name: &str) -> String {
+    let mut parts = text.split("//@ ");
     let header = parts.next().unwrap_or_default();
     let section = parts
-        .find(|p| p.starts_with(name) && p[name.len()..].starts_with('\n'))
+        .find(|p| p.starts_with(name) && p[name.len()..].starts_with(['\n', '\r']))
         .unwrap_or_else(|| panic!("gpu.wgsl has no section {name}"));
     // The section's name line stays, as a comment.
     format!("{header}// {section}")
@@ -739,6 +745,8 @@ mod tests {
 
     #[test]
     fn every_kernel_has_a_section() {
+        // As git checks the file out on Windows.
+        let crlf = SOURCE.replace("\r\n", "\n").replace('\n', "\r\n");
         for name in [
             "conv",
             "gn_partial",
@@ -747,8 +755,11 @@ mod tests {
             "add",
             "upsample",
         ] {
-            let s = source(name);
-            assert!(s.contains("struct P") && s.contains("fn main"), "{name}");
+            for text in [SOURCE, crlf.as_str()] {
+                let s = section(text, name);
+                assert!(s.contains("struct P"), "{name}");
+                assert_eq!(s.matches("fn main").count(), 1, "{name}");
+            }
         }
     }
 
