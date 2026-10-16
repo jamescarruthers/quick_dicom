@@ -125,47 +125,90 @@ struct Smooth {
     inside: f32,
 }
 
-// The eight label voxels round grid point g, lower slice first, with
-// their trilinear weights.
+// The eight label voxels round a grid point, lower slice first, x
+// fastest, with their trilinear weights. No arrays: Direct3D's FXC
+// compiler cannot index local arrays at run time.
 struct Corners {
-    v: array<Voxel, 8>,
-    w: array<f32, 8>,
+    v0: Voxel,
+    v1: Voxel,
+    v2: Voxel,
+    v3: Voxel,
+    v4: Voxel,
+    v5: Voxel,
+    v6: Voxel,
+    v7: Voxel,
+    // The weights of the lower slice's four, then the upper's.
+    lower: vec4<f32>,
+    upper: vec4<f32>,
 }
 
 fn corners(g: vec3<f32>) -> Corners {
     let b = floor(g);
     let f = g - b;
     let q = vec3<i32>(b);
-    var c: Corners;
-    for (var i = 0; i < 8; i++) {
-        let o = vec3<i32>(i & 1, (i >> 1) & 1, (i >> 2) & 1);
-        c.v[i] = label_voxel(q + o);
-        let t = select(1.0 - f, f, o == vec3<i32>(1));
-        c.w[i] = t.x * t.y * t.z;
-    }
-    return c;
+    let across = vec4<f32>(
+        (1.0 - f.x) * (1.0 - f.y),
+        f.x * (1.0 - f.y),
+        (1.0 - f.x) * f.y,
+        f.x * f.y,
+    );
+    return Corners(
+        label_voxel(q),
+        label_voxel(q + vec3<i32>(1, 0, 0)),
+        label_voxel(q + vec3<i32>(0, 1, 0)),
+        label_voxel(q + vec3<i32>(1, 1, 0)),
+        label_voxel(q + vec3<i32>(0, 0, 1)),
+        label_voxel(q + vec3<i32>(1, 0, 1)),
+        label_voxel(q + vec3<i32>(0, 1, 1)),
+        label_voxel(q + vec3<i32>(1, 1, 1)),
+        across * (1.0 - f.z),
+        across * f.z,
+    );
 }
 
-// How far inside label a a point lies, from its eight voxels: for their
-// own label, their distance inside it; for the label of the voxel across
-// the slab from them, their distance from it; for any other, their
-// distance inside their own region, against.
-fn inside_corners(c: Corners, a: u32) -> f32 {
-    var inside = 0.0;
-    for (var j = 0; j < 8; j++) {
-        let v = c.v[j];
-        var d: f32;
-        if v.id == a {
-            d = v.d.x;
-        } else if c.v[j ^ 4].id == a {
-            // Corners 0 to 3 are on the lower slice: their partner is above.
-            d = -select(v.d.z, v.d.y, j < 4);
-        } else {
-            d = -v.d.x;
-        }
-        inside += c.w[j] * d;
+// One voxel's part in how far inside label a a point lies: its distance
+// inside its own label; for the label of the voxel across the slab from
+// it, `partner`, its distance from that, `from_partner`; for any other,
+// its distance inside its own region, against.
+fn part(v: Voxel, partner: u32, from_partner: f32, a: u32) -> f32 {
+    if v.id == a {
+        return v.d.x;
     }
-    return inside;
+    if partner == a {
+        return -from_partner;
+    }
+    return -v.d.x;
+}
+
+// How far inside label a a point lies, from its eight voxels. The lower
+// slice's partners are above them, the upper's below.
+fn inside_corners(c: Corners, a: u32) -> f32 {
+    let lower = vec4<f32>(
+        part(c.v0, c.v4.id, c.v0.d.y, a),
+        part(c.v1, c.v5.id, c.v1.d.y, a),
+        part(c.v2, c.v6.id, c.v2.d.y, a),
+        part(c.v3, c.v7.id, c.v3.d.y, a),
+    );
+    let upper = vec4<f32>(
+        part(c.v4, c.v0.id, c.v4.d.z, a),
+        part(c.v5, c.v1.id, c.v5.d.z, a),
+        part(c.v6, c.v2.id, c.v6.d.z, a),
+        part(c.v7, c.v3.id, c.v7.d.z, a),
+    );
+    return dot(lower, c.lower) + dot(upper, c.upper);
+}
+
+// The better of `best` and label a. A label met twice sums the same and
+// does not replace itself.
+fn better(c: Corners, a: u32, best: Smooth) -> Smooth {
+    if a == 0u {
+        return best;
+    }
+    let inside = inside_corners(c, a);
+    if inside > best.inside {
+        return Smooth(a, inside);
+    }
+    return best;
 }
 
 // The label whose smooth surface holds label grid point g, and how far
@@ -176,31 +219,24 @@ fn inside_corners(c: Corners, a: u32) -> f32 {
 fn smooth_label(g: vec3<f32>) -> Smooth {
     let c = corners(g);
     // Most points lie among voxels of one label, or none.
-    var same = true;
-    for (var i = 1; i < 8; i++) {
-        same = same && c.v[i].id == c.v[0].id;
-    }
-    if same {
-        if c.v[0].id == 0u {
+    let first = vec4<u32>(c.v0.id);
+    let lower = vec4<u32>(c.v0.id, c.v1.id, c.v2.id, c.v3.id);
+    let upper = vec4<u32>(c.v4.id, c.v5.id, c.v6.id, c.v7.id);
+    if all(lower == first) && all(upper == first) {
+        if c.v0.id == 0u {
             return Smooth(0u, -1.0);
         }
-        return Smooth(c.v[0].id, inside_corners(c, c.v[0].id));
+        return Smooth(c.v0.id, inside_corners(c, c.v0.id));
     }
     var best = Smooth(0u, -1e30);
-    for (var i = 0; i < 8; i++) {
-        let a = c.v[i].id;
-        var seen = a == 0u;
-        for (var j = 0; j < i; j++) {
-            seen = seen || c.v[j].id == a;
-        }
-        if seen {
-            continue;
-        }
-        let inside = inside_corners(c, a);
-        if inside > best.inside {
-            best = Smooth(a, inside);
-        }
-    }
+    best = better(c, c.v0.id, best);
+    best = better(c, c.v1.id, best);
+    best = better(c, c.v2.id, best);
+    best = better(c, c.v3.id, best);
+    best = better(c, c.v4.id, best);
+    best = better(c, c.v5.id, best);
+    best = better(c, c.v6.id, best);
+    best = better(c, c.v7.id, best);
     if best.inside <= 0.0 {
         best.id = 0u;
     }
