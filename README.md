@@ -221,8 +221,21 @@ The **AI** menu runs an AI model on the current series and shows the
 structures it finds. The viewer outlines each one, in its own colour, on
 every slice, and shows them solid in the 3D view, with the rest of the scan
 faint around them. The value under the pointer gains the name of the
-structure there. **Show labels** (G) hides and shows them, and the menu
-lists the structures found, with their colours.
+structure there. **Show labels** (G) hides and shows them all.
+
+A panel on the right lists the structures found, in the model's order,
+each with its colour:
+
+- Untick a structure to hide it on the slices and in 3D; tick it to show
+  it again. **Show all** and **Hide all** act on the structures listed,
+  so type in the filter box (for example `rib`) and hide them all at once.
+- Click a name to go to the middle of that structure. Hover over it to see
+  which slices it spans.
+- **Names** puts each structure's name on the image. **On hover**, the
+  default, names the structure under the pointer, on a slice or in 3D.
+  **Always** names every structure shown, largest first, where there is
+  room; in 3D a name is faint when another structure stands in front of
+  it.
 
 #### Built-in models
 

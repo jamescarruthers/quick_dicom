@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -14,9 +15,9 @@ use crate::decode::{Frame, Spacing};
 use crate::export::{self, Export};
 use crate::filter::{self, Filters, Level};
 use crate::loader::{Loader, Slot};
-use crate::monai::{self, Connecting, Model, Segmentation, Segmenting};
+use crate::monai::{self, Connecting, LabelMask, Model, Segmentation, Segmenting};
 use crate::render::{ImageCallback, ImageRenderer, Uniforms};
-use crate::render3d::{Scene, VolumeCallback, VolumeRenderer, VolumeUniforms};
+use crate::render3d::{Projection, Scene, VolumeCallback, VolumeRenderer, VolumeUniforms};
 use crate::scan::{FrameRef, Library, ScanEvent, Scanner, Stack};
 use crate::volume::{Volume, VolumeJob};
 
@@ -134,6 +135,43 @@ struct Monai {
     result: Option<Arc<Segmentation>>,
     /// Lay the labels over the images and colour them in 3D.
     show: bool,
+    /// Structures the user has hidden, and the same as the GPU reads it.
+    hidden: BTreeSet<u16>,
+    mask: Arc<LabelMask>,
+    /// When to name structures on the image and in 3D.
+    names: Names,
+    /// Narrows the list of structures.
+    filter: String,
+    /// The current slice's structures and where their names go, kept
+    /// while the segmentation, slice and shown labels stay the same.
+    slice_names: Option<SliceNames>,
+}
+
+/// The segmentation, slice and mask generation the names were placed
+/// for, then each structure with the pixel its name goes on.
+type SliceNames = ((u64, usize, u64), Vec<(u16, [u32; 2])>);
+
+/// When structures are named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Names {
+    Off,
+    /// The one under the pointer.
+    Hover,
+    /// Every one shown, where there is room.
+    Always,
+}
+
+impl Monai {
+    fn set_result(&mut self, seg: Segmentation) {
+        self.result = Some(Arc::new(seg));
+        self.show = true;
+        self.set_hidden(BTreeSet::new());
+    }
+
+    fn set_hidden(&mut self, hidden: BTreeSet<u16>) {
+        self.mask = Arc::new(LabelMask::hiding(&hidden));
+        self.hidden = hidden;
+    }
 }
 
 impl Default for Monai {
@@ -152,6 +190,11 @@ impl Default for Monai {
             device: None,
             result: None,
             show: true,
+            hidden: BTreeSet::new(),
+            mask: Arc::new(LabelMask::hiding(&BTreeSet::new())),
+            names: Names::Hover,
+            filter: String::new(),
+            slice_names: None,
         }
     }
 }
@@ -887,8 +930,7 @@ impl ViewerApp {
                         1 => format!("{}: 1 label found", seg.model),
                         n => format!("{}: {n} labels found", seg.model),
                     };
-                    m.result = Some(Arc::new(seg));
-                    m.show = true;
+                    m.set_result(seg);
                     m.job = None;
                 }
                 Some(Err(e)) => {
@@ -916,8 +958,7 @@ impl ViewerApp {
                         1 => format!("{}: 1 structure found in {time} {place}", seg.model),
                         n => format!("{}: {n} structures found in {time} {place}", seg.model),
                     };
-                    m.result = Some(Arc::new(seg));
-                    m.show = true;
+                    m.set_result(seg);
                     m.builtin_job = None;
                 }
                 Some(Err(e)) => {
@@ -1031,30 +1072,258 @@ impl ViewerApp {
                         "The labels from {} belong to another series.",
                         seg.model
                     ));
-                    return;
+                } else if seg.found.is_empty() {
+                    ui.weak("No labels were found in this series.");
+                } else {
+                    ui.weak("The structures found are listed on the right.");
                 }
-                egui::ScrollArea::vertical()
-                    .min_scrolled_height(200.0)
-                    .max_height(260.0)
-                    .show(ui, |ui| {
-                        for &id in &seg.found {
-                            let [r, g, b] =
-                                crate::colormap::label_colour(id).map(|c| (c * 255.0) as u8);
-                            ui.horizontal(|ui| {
-                                let (swatch, _) =
-                                    ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
-                                ui.painter()
-                                    .rect_filled(swatch, 2.0, Color32::from_rgb(r, g, b));
-                                ui.label(seg.name(id));
-                            });
-                        }
-                        if seg.found.is_empty() {
-                            ui.weak("No labels were found in this series.");
-                        }
-                    });
             })
             .0
             .on_hover_text("Segment the series with an AI model");
+    }
+
+    /// The segmentation of the selected series, shown or not.
+    fn segmentation_here(&self) -> Option<Arc<Segmentation>> {
+        let stack = self.stack()?;
+        self.monai
+            .result
+            .clone()
+            .filter(|s| s.key == stack.key && s.depth as usize == stack.frames.len())
+    }
+
+    /// The structures found in this series: show or hide each, go to it,
+    /// and choose when they are named.
+    fn structures_panel(&mut self, ui: &mut egui::Ui, seg: &Segmentation) {
+        let m = &mut self.monai;
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.strong("Structures");
+            ui.weak(seg.structures.len().to_string());
+        });
+        ui.weak(&seg.model);
+        ui.add_space(2.0);
+        ui.checkbox(&mut m.show, "Show (G)")
+            .on_hover_text("Lay the structures over the images, and colour them in 3D");
+        ui.horizontal(|ui| {
+            ui.label("Names");
+            ui.selectable_value(&mut m.names, Names::Off, "Off");
+            ui.selectable_value(&mut m.names, Names::Hover, "On hover")
+                .on_hover_text("Name the structure under the pointer");
+            ui.selectable_value(&mut m.names, Names::Always, "Always")
+                .on_hover_text("Name every structure shown, where there is room");
+        });
+        if seg.structures.len() > 8 {
+            ui.add(
+                egui::TextEdit::singleline(&mut m.filter)
+                    .hint_text("Filter")
+                    .desired_width(f32::INFINITY),
+            );
+        }
+        let needle = m.filter.trim().to_lowercase();
+        let listed: Vec<(&monai::Structure, String)> = seg
+            .structures
+            .iter()
+            .map(|s| (s, seg.name(s.label)))
+            .filter(|(_, name)| needle.is_empty() || name.to_lowercase().contains(&needle))
+            .collect();
+        let mut hidden = m.hidden.clone();
+        ui.horizontal(|ui| {
+            if ui.button("Show all").clicked() {
+                for (s, _) in &listed {
+                    hidden.remove(&s.label);
+                }
+            }
+            if ui.button("Hide all").clicked() {
+                for (s, _) in &listed {
+                    hidden.insert(s.label);
+                }
+            }
+        });
+        ui.separator();
+        let mut go_to = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (s, name) in &listed {
+                    ui.horizontal(|ui| {
+                        let mut shown = !hidden.contains(&s.label);
+                        if ui.checkbox(&mut shown, "").changed() {
+                            if shown {
+                                hidden.remove(&s.label);
+                            } else {
+                                hidden.insert(s.label);
+                            }
+                        }
+                        let [r, g, b] =
+                            crate::colormap::label_colour(s.label).map(|c| (c * 255.0) as u8);
+                        let (swatch, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                        ui.painter()
+                            .rect_filled(swatch, 2.0, Color32::from_rgb(r, g, b));
+                        let text = if shown {
+                            egui::RichText::new(name)
+                        } else {
+                            egui::RichText::new(name).weak()
+                        };
+                        let (first, last) = s.slices;
+                        let place = if first == last {
+                            format!("On slice {}", first + 1)
+                        } else {
+                            format!("Slices {} to {}", first + 1, last + 1)
+                        };
+                        if ui
+                            .add(egui::Label::new(text).sense(Sense::click()).truncate())
+                            .on_hover_text(format!("{place}. Click to go to it."))
+                            .clicked()
+                        {
+                            go_to = Some(s.anchor[2] as usize);
+                        }
+                    });
+                }
+                if listed.is_empty() {
+                    ui.weak("Nothing matches.");
+                }
+            });
+        if hidden != m.hidden {
+            m.set_hidden(hidden);
+        }
+        if let Some(k) = go_to {
+            self.index = k;
+            self.playing = false;
+        }
+    }
+
+    /// A structure's name centred on `at`, on a dark plate, with its
+    /// colour; faint when something stands in front of it. Returns where
+    /// it went.
+    fn draw_name(painter: &egui::Painter, at: Pos2, name: &str, label: u16, faint: bool) -> Rect {
+        let alpha = if faint { 0.5 } else { 1.0 };
+        let galley = painter.layout_no_wrap(
+            name.to_string(),
+            FontId::proportional(12.5),
+            Color32::from_gray(235).gamma_multiply(alpha),
+        );
+        let rect = Rect::from_center_size(at, galley.size() + Vec2::new(18.0, 4.0));
+        painter.rect_filled(
+            rect,
+            4.0,
+            Color32::from_black_alpha(170).gamma_multiply(alpha),
+        );
+        let [r, g, b] = crate::colormap::label_colour(label).map(|c| (c * 255.0) as u8);
+        painter.circle_filled(
+            rect.left_center() + Vec2::new(7.0, 0.0),
+            3.5,
+            Color32::from_rgb(r, g, b).gamma_multiply(alpha),
+        );
+        painter.galley(rect.min + Vec2::new(13.0, 2.0), galley, Color32::WHITE);
+        rect
+    }
+
+    /// The space a name would take, centred on `at`.
+    fn name_rect(painter: &egui::Painter, at: Pos2, name: &str) -> Rect {
+        let galley =
+            painter.layout_no_wrap(name.to_string(), FontId::proportional(12.5), Color32::WHITE);
+        Rect::from_center_size(at, galley.size() + Vec2::new(18.0, 4.0))
+    }
+
+    /// Names on the image: the structure under the pointer, or every one
+    /// on this slice where there is room. `to_screen` maps label pixel
+    /// positions to the screen, `to_label` the reverse.
+    fn names_2d(
+        &mut self,
+        painter: &egui::Painter,
+        seg: &Segmentation,
+        hover: Option<Pos2>,
+        to_screen: impl Fn(f32, f32) -> Pos2,
+        to_label: impl Fn(Pos2) -> Option<(u32, u32)>,
+    ) {
+        let k = self.index;
+        let m = &mut self.monai;
+        match m.names {
+            Names::Off => {}
+            Names::Hover => {
+                if let Some(p) = hover
+                    && let Some((x, y)) = to_label(p)
+                {
+                    let id = seg.at(x, y, k as u32);
+                    if m.mask.shows(id) {
+                        Self::draw_name(
+                            painter,
+                            p + Vec2::new(0.0, -22.0),
+                            &seg.name(id),
+                            id,
+                            false,
+                        );
+                    }
+                }
+            }
+            Names::Always => {
+                let key = (seg.id, k, m.mask.generation);
+                if m.slice_names.as_ref().is_none_or(|(have, _)| *have != key) {
+                    m.slice_names = Some((key, slice_anchors(seg, k, &m.mask)));
+                }
+                let mut taken: Vec<Rect> = Vec::new();
+                for &(id, [x, y]) in &m.slice_names.as_ref().unwrap().1 {
+                    let at = to_screen(x as f32 + 0.5, y as f32 + 0.5);
+                    if !painter.clip_rect().contains(at) {
+                        continue;
+                    }
+                    let name = seg.name(id);
+                    let r = Self::name_rect(painter, at, &name);
+                    if taken.iter().any(|t| t.intersects(r)) {
+                        continue;
+                    }
+                    taken.push(Self::draw_name(painter, at, &name, id, false));
+                }
+            }
+        }
+    }
+
+    /// Names in 3D: the structure under the pointer, or every one shown,
+    /// largest first where there is room, faint when another stands in
+    /// front of it.
+    fn names_3d(
+        &self,
+        painter: &egui::Painter,
+        rect: Rect,
+        seg: &Segmentation,
+        projection: &Projection,
+        hover: Option<Pos2>,
+    ) {
+        let mask = &self.monai.mask;
+        match self.monai.names {
+            Names::Off => {}
+            Names::Hover => {
+                if let Some(p) = hover
+                    && let Some(id) =
+                        projection.label_under(seg, mask, (p.x - rect.left(), p.y - rect.top()))
+                {
+                    Self::draw_name(painter, p + Vec2::new(0.0, -22.0), &seg.name(id), id, false);
+                }
+            }
+            Names::Always => {
+                let mut order: Vec<&monai::Structure> = seg
+                    .structures
+                    .iter()
+                    .filter(|s| mask.shows(s.label))
+                    .collect();
+                order.sort_by_key(|s| std::cmp::Reverse(s.voxels));
+                let mut taken: Vec<Rect> = Vec::new();
+                for s in order {
+                    let (x, y) = projection.voxel_in_view(seg, s.anchor);
+                    let at = rect.min + Vec2::new(x, y);
+                    if !rect.contains(at) {
+                        continue;
+                    }
+                    let name = seg.name(s.label);
+                    let r = Self::name_rect(painter, at, &name);
+                    if taken.iter().any(|t| t.intersects(r)) {
+                        continue;
+                    }
+                    let faint = projection.behind_another(seg, mask, s.label, s.anchor);
+                    taken.push(Self::draw_name(painter, at, &name, s.label, faint));
+                }
+            }
+        }
     }
 
     /// Connect to a MONAI Label server, pick one of its models, and send it
@@ -1416,7 +1685,9 @@ impl ViewerApp {
         if let Some(volume) = volume {
             let range = frame.as_ref().map_or(volume.window.1, |f| f.max - f.min);
             self.interact_3d(ui, &resp, rect, range);
-            let info = self.draw_3d(&painter, rect, &volume, ui.ctx().pixels_per_point());
+            // Names follow the pointer, but not while it turns the view.
+            let hover = resp.hover_pos().filter(|_| !resp.dragged());
+            let info = self.draw_3d(&painter, rect, &volume, ui.ctx().pixels_per_point(), hover);
             self.overlay_text(&painter, rect, &stack, Some(info), None, font, text_color);
             return;
         }
@@ -1472,7 +1743,9 @@ impl ViewerApp {
                 uniforms,
                 filters: self.view.filters,
                 sigma: filter::sigma_for(scale * ui.ctx().pixels_per_point()),
-                labels: self.labels().map(|s| (s, self.index)),
+                labels: self
+                    .labels()
+                    .map(|s| (s, self.index, self.monai.mask.clone())),
             },
         ));
 
@@ -1480,6 +1753,18 @@ impl ViewerApp {
             && let Some(spacing) = frame.spacing
         {
             draw_rulers(&painter, rect, spacing, scale);
+        }
+        if let Some(seg) = self.labels() {
+            // Labels may be finer or coarser than the frame.
+            let (sw, sh) = (seg.width as f32, seg.height as f32);
+            let (fx, fy) = (w / sw * scale, h / sh * scale);
+            let to_screen = |x: f32, y: f32| img.min + Vec2::new(x * fx, y * fy);
+            let to_label = |p: Pos2| {
+                let (x, y) = ((p.x - img.left()) / fx, (p.y - img.top()) / fy);
+                (x >= 0.0 && y >= 0.0 && x < sw && y < sh).then_some((x as u32, y as u32))
+            };
+            let hover = resp.hover_pos().filter(|_| !resp.dragged());
+            self.names_2d(&painter, &seg, hover, to_screen, to_label);
         }
         if self.three_d.on
             && let Some(job) = &self.volume_job
@@ -1506,7 +1791,7 @@ impl ViewerApp {
                 let lx = (x * seg.width as f32 / w) as u32;
                 let ly = (y * seg.height as f32 / h) as u32;
                 let id = seg.at(lx, ly, self.index as u32);
-                if id > 0 {
+                if id > 0 && self.monai.mask.shows(id) {
                     text.push_str(&format!("  ·  {}", seg.name(id)));
                 }
             }
@@ -1625,6 +1910,7 @@ impl ViewerApp {
         rect: Rect,
         volume: &Arc<Volume>,
         ppp: f32,
+        hover: Option<Pos2>,
     ) -> String {
         let t = smoothstep(self.three_d.t);
         let (w, h, d) = (
@@ -1682,10 +1968,19 @@ impl ViewerApp {
                 uniforms,
                 size_px,
                 error: self.gpu_error.clone(),
-                labels: self.labels(),
+                labels: self.labels().map(|s| (s, self.monai.mask.clone())),
                 notice: self.gpu_notice.clone(),
             },
         ));
+        // Names once the volume has turned fully into 3D; maximum
+        // intensity leaves the structures out.
+        if let Some(seg) = self.labels()
+            && t >= 1.0
+            && !maximum
+        {
+            let projection = Projection::new(&scene, &uniforms, volume.stride);
+            self.names_3d(painter, rect, &seg, &projection, hover);
+        }
 
         let mut info = format!("3D · {} slices", volume.depth);
         if volume.stride > 1 {
@@ -1786,11 +2081,55 @@ impl eframe::App for ViewerApp {
             .default_size(320.0)
             .min_size(160.0)
             .show(ui, |ui| self.browser(ui));
+        if let Some(seg) = self.segmentation_here() {
+            egui::Panel::right("structures")
+                .resizable(true)
+                .default_size(240.0)
+                .min_size(170.0)
+                .show(ui, |ui| self.structures_panel(ui, &seg));
+        }
         egui::CentralPanel::no_frame().show(ui, |ui| self.viewer(ui));
 
         // Requests may have changed while drawing (slider, wheel, clicks).
         self.update_requests();
     }
+}
+
+/// Each shown structure on slice `k`, largest first, with its pixel
+/// nearest its centre on that slice: where its name goes.
+fn slice_anchors(seg: &Segmentation, k: usize, mask: &LabelMask) -> Vec<(u16, [u32; 2])> {
+    if k >= seg.depth as usize {
+        return Vec::new();
+    }
+    let w = seg.width as usize;
+    let slice = seg.slice(k);
+    let mut sums: std::collections::BTreeMap<u16, (usize, f64, f64)> = Default::default();
+    for (i, &v) in slice.iter().enumerate() {
+        if mask.shows(v) {
+            let e = sums.entry(v).or_default();
+            e.0 += 1;
+            e.1 += (i % w) as f64;
+            e.2 += (i / w) as f64;
+        }
+    }
+    let mut best: std::collections::BTreeMap<u16, (f64, [u32; 2])> = Default::default();
+    for (i, &v) in slice.iter().enumerate() {
+        if let Some(&(n, sx, sy)) = sums.get(&v) {
+            let (cx, cy) = (sx / n as f64, sy / n as f64);
+            let (x, y) = ((i % w) as f64, (i / w) as f64);
+            let d = (x - cx).powi(2) + (y - cy).powi(2);
+            let e = best.entry(v).or_insert((f64::MAX, [0, 0]));
+            if d < e.0 {
+                *e = (d, [x as u32, y as u32]);
+            }
+        }
+    }
+    let mut out: Vec<(usize, u16, [u32; 2])> = best
+        .into_iter()
+        .map(|(id, (_, p))| (sums[&id].0, id, p))
+        .collect();
+    out.sort_by_key(|&(n, id, _)| (std::cmp::Reverse(n), id));
+    out.into_iter().map(|(_, id, p)| (id, p)).collect()
 }
 
 /// A file name from a stack label: "#3 XA Coronary run  [30 fr]" becomes

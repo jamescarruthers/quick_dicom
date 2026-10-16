@@ -33,6 +33,8 @@ struct Uniforms {
 @group(0) @binding(2) var volume_sampler: sampler;
 // Segmentation labels at the scan's full resolution, 0 for none.
 @group(1) @binding(0) var label_map: texture_3d<u32>;
+// Which labels are shown: label l at (l % 256, l / 256), 0 for hidden.
+@group(1) @binding(1) var label_shown: texture_2d<u32>;
 
 struct RayIn {
     @builtin(position) pos: vec4<f32>,
@@ -66,9 +68,9 @@ fn value(p: vec3<f32>) -> f32 {
     return textureSampleLevel(volume, volume_sampler, to_texture(p), 0.0).r;
 }
 
-// The label at a model point: the labels cover the same box as the
-// volume, at their own resolution, and the volume may hold only every
-// so many of their slices.
+// The label at a model point, or 0 where it is hidden: the labels cover
+// the same box as the volume, at their own resolution, and the volume may
+// hold only every so many of their slices.
 fn label_at(p: vec3<f32>) -> u32 {
     let size = vec3<i32>(textureDimensions(label_map));
     let tex = to_texture(p);
@@ -81,7 +83,9 @@ fn label_at(p: vec3<f32>) -> u32 {
     if any(q < vec3<i32>(0)) || any(q >= size) {
         return 0u;
     }
-    return textureLoad(label_map, q, 0).r;
+    let id = textureLoad(label_map, q, 0).r;
+    let shown = textureLoad(label_shown, vec2<i32>(i32(id % 256u), i32(id / 256u)), 0).r;
+    return select(0u, id, shown != 0u);
 }
 
 fn inside(p: vec3<f32>, id: u32) -> f32 {

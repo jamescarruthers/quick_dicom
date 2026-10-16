@@ -7,7 +7,7 @@ use eframe::egui_wgpu::{self, wgpu};
 use crate::contrast::{self, BINS, Curves, MAX_TILES};
 use crate::decode::{Frame, Pixels};
 use crate::filter::{self, Filters, GpuFilters, Targets};
-use crate::monai::Segmentation;
+use crate::monai::{LabelMask, Segmentation};
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -19,6 +19,75 @@ pub struct Uniforms {
     /// Segmentation labels: shown (0 or 1), their width and height. Set by
     /// the renderer.
     pub labels: [f32; 4],
+}
+
+/// Which labels are shown, on the GPU: 256 × 256 bytes, as the image and
+/// volume shaders read them.
+pub struct MaskTexture {
+    texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    holds: Option<u64>,
+}
+
+impl MaskTexture {
+    pub fn new(device: &wgpu::Device) -> MaskTexture {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shown labels"),
+            size: wgpu::Extent3d {
+                width: 256,
+                height: 256,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        MaskTexture {
+            texture,
+            view,
+            holds: None,
+        }
+    }
+
+    /// Upload `mask` unless it is there already.
+    pub fn update(&mut self, queue: &wgpu::Queue, mask: &LabelMask) {
+        if self.holds == Some(mask.generation) {
+            return;
+        }
+        queue.write_texture(
+            self.texture.as_image_copy(),
+            mask.bytes(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: Some(256),
+            },
+            wgpu::Extent3d {
+                width: 256,
+                height: 256,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.holds = Some(mask.generation);
+    }
+}
+
+/// The bind group layout entry for the shown-labels texture.
+pub fn mask_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Uint,
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
 }
 
 /// One slice of segmentation labels, as a texture the image shader reads.
@@ -69,6 +138,7 @@ pub struct ImageRenderer {
     show_filtered: bool,
     labels_layout: wgpu::BindGroupLayout,
     labels: LabelSlice,
+    mask: MaskTexture,
 }
 
 impl ImageRenderer {
@@ -116,17 +186,21 @@ impl ImageRenderer {
         });
         let labels_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("segmentation labels"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Uint,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                mask_entry(1),
+            ],
         });
+        let mask = MaskTexture::new(device);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("dicom image"),
             bind_group_layouts: &[Some(&layout), Some(&labels_layout)],
@@ -196,8 +270,9 @@ impl ImageRenderer {
             curves_made: None,
             tiles: (0, 0),
             show_filtered: false,
-            labels: label_slice(device, &labels_layout, (1, 1)),
+            labels: label_slice(device, &labels_layout, (1, 1), &mask.view),
             labels_layout,
+            mask,
         }
     }
 
@@ -214,7 +289,7 @@ impl ImageRenderer {
         }
         let size = (seg.width, seg.height);
         if self.labels.size != size {
-            self.labels = label_slice(device, &self.labels_layout, size);
+            self.labels = label_slice(device, &self.labels_layout, size, &self.mask.view);
         }
         queue.write_texture(
             self.labels.texture.as_image_copy(),
@@ -314,7 +389,7 @@ impl ImageRenderer {
         uniforms: Uniforms,
         filters: Filters,
         sigma: f32,
-        labels: Option<(&Segmentation, usize)>,
+        labels: Option<(&Segmentation, usize, &LabelMask)>,
     ) {
         if self.uploaded != frame.id {
             self.upload(device, queue, frame);
@@ -323,7 +398,8 @@ impl ImageRenderer {
 
         let mut u = uniforms;
         u.labels = [0.0; 4];
-        if let Some((seg, k)) = labels.filter(|(s, k)| *k < s.depth as usize) {
+        if let Some((seg, k, mask)) = labels.filter(|(s, k, _)| *k < s.depth as usize) {
+            self.mask.update(queue, mask);
             self.upload_labels(device, queue, seg, k);
             u.labels = [1.0, seg.width as f32, seg.height as f32, 0.0];
         }
@@ -440,6 +516,7 @@ fn label_slice(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
     size: (u32, u32),
+    mask: &wgpu::TextureView,
 ) -> LabelSlice {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("segmentation labels"),
@@ -459,10 +536,16 @@ fn label_slice(
     let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("segmentation labels"),
         layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: wgpu::BindingResource::TextureView(&view),
-        }],
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(mask),
+            },
+        ],
     });
     LabelSlice {
         texture,
@@ -508,8 +591,9 @@ pub struct ImageCallback {
     pub filters: Filters,
     /// Sharpening blur, in image pixels.
     pub sigma: f32,
-    /// Segmentation labels to lay over the frame, and which slice of them.
-    pub labels: Option<(Arc<Segmentation>, usize)>,
+    /// Segmentation labels to lay over the frame, which slice of them, and
+    /// which labels are shown.
+    pub labels: Option<(Arc<Segmentation>, usize, Arc<LabelMask>)>,
 }
 
 impl egui_wgpu::CallbackTrait for ImageCallback {
@@ -530,7 +614,7 @@ impl egui_wgpu::CallbackTrait for ImageCallback {
                 self.uniforms,
                 self.filters,
                 self.sigma,
-                self.labels.as_ref().map(|(s, k)| (&**s, *k)),
+                self.labels.as_ref().map(|(s, k, m)| (&**s, *k, &**m)),
             );
         }
         Vec::new()
@@ -716,7 +800,7 @@ mod tests {
         frame: &Frame,
         uniforms: Uniforms,
         filters: Filters,
-        labels: Option<(&Segmentation, usize)>,
+        labels: Option<(&Segmentation, usize, &LabelMask)>,
     ) -> Vec<u8> {
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: None,
@@ -794,6 +878,7 @@ mod tests {
             voxels,
             Vec::new(),
         );
+        let all = LabelMask::hiding(&Default::default());
         let uniforms = Uniforms {
             rect: [-1.0, 1.0, 1.0, -1.0],
             tex: [w as f32, h as f32, 0.0, 0.0],
@@ -823,7 +908,7 @@ mod tests {
             &frame,
             uniforms,
             Filters::default(),
-            Some((&seg, 1)),
+            Some((&seg, 1, &all)),
         );
         check(&image, 24, 18, &tint, "inside");
         check(&image, 16, 18, &c, "left edge");
@@ -840,9 +925,22 @@ mod tests {
             &frame,
             uniforms,
             Filters::default(),
-            Some((&seg, 0)),
+            Some((&seg, 0, &all)),
         );
         check(&image, 24, 18, &grey, "empty slice");
+        // Hidden, label 2 leaves no tint and no edge.
+        let hidden = LabelMask::hiding(&[2].into_iter().collect());
+        let image = draw(
+            &mut renderer,
+            &device,
+            &queue,
+            &frame,
+            uniforms,
+            Filters::default(),
+            Some((&seg, 1, &hidden)),
+        );
+        check(&image, 24, 18, &grey, "hidden inside");
+        check(&image, 16, 18, &grey, "hidden edge");
         let image = draw(
             &mut renderer,
             &device,
