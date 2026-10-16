@@ -305,6 +305,47 @@ fn pixel_spacing(obj: &DefaultDicomObject, frame: u32) -> Option<Spacing> {
         })
 }
 
+/// Where a frame lies in the patient: the centre of its first pixel and
+/// the directions of its rows and columns, in DICOM patient coordinates
+/// (millimetres, x to the patient's left, y to the back, z to the head).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Plane {
+    pub position: [f64; 3],
+    /// Direction in which column index grows, along a row.
+    pub row: [f64; 3],
+    /// Direction in which row index grows, down a column.
+    pub column: [f64; 3],
+    /// Millimetres between rows and between columns.
+    pub spacing: (f64, f64),
+}
+
+/// The frame's plane, from Image Position and Orientation (Patient) and
+/// Pixel Spacing, including enhanced multi-frame groups.
+pub fn plane(obj: &DefaultDicomObject, frame: u32) -> Option<Plane> {
+    let p = functional_values(
+        obj,
+        frame,
+        tags::PLANE_POSITION_SEQUENCE,
+        tags::IMAGE_POSITION_PATIENT,
+    )?;
+    let o = functional_values(
+        obj,
+        frame,
+        tags::PLANE_ORIENTATION_SEQUENCE,
+        tags::IMAGE_ORIENTATION_PATIENT,
+    )?;
+    let s = pixel_spacing(obj, frame).filter(|s| !s.at_detector)?;
+    if p.len() < 3 || o.len() < 6 {
+        return None;
+    }
+    Some(Plane {
+        position: [p[0], p[1], p[2]],
+        row: [o[0], o[1], o[2]],
+        column: [o[3], o[4], o[5]],
+        spacing: (s.row as f64, s.col as f64),
+    })
+}
+
 /// Distance of the slice along its normal, from Image Position and Image
 /// Orientation (Patient), including enhanced multi-frame groups.
 fn slice_position(obj: &DefaultDicomObject, frame: u32) -> Option<f32> {

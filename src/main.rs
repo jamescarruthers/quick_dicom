@@ -1,6 +1,7 @@
 // Hide the console window on Windows release builds.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod ai;
 mod app;
 mod check;
 mod colormap;
@@ -9,7 +10,9 @@ mod decode;
 mod export;
 mod filter;
 mod loader;
+mod monai;
 mod mp4;
+mod nifti;
 mod render;
 mod render3d;
 mod scan;

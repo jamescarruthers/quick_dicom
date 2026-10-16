@@ -7,6 +7,7 @@ use eframe::egui_wgpu::{self, wgpu};
 use crate::contrast::{self, BINS, Curves, MAX_TILES};
 use crate::decode::{Frame, Pixels};
 use crate::filter::{self, Filters, GpuFilters, Targets};
+use crate::monai::Segmentation;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
@@ -15,6 +16,18 @@ pub struct Uniforms {
     pub tex: [f32; 4],
     pub wl: [f32; 4],
     pub mode: [f32; 4],
+    /// Segmentation labels: shown (0 or 1), their width and height. Set by
+    /// the renderer.
+    pub labels: [f32; 4],
+}
+
+/// One slice of segmentation labels, as a texture the image shader reads.
+struct LabelSlice {
+    texture: wgpu::Texture,
+    group: wgpu::BindGroup,
+    size: (u32, u32),
+    /// Segmentation and slice it holds.
+    holds: Option<(u64, usize)>,
 }
 
 struct Texture {
@@ -54,6 +67,8 @@ pub struct ImageRenderer {
     tiles: (usize, usize),
     /// Draw the filtered frame this time.
     show_filtered: bool,
+    labels_layout: wgpu::BindGroupLayout,
+    labels: LabelSlice,
 }
 
 impl ImageRenderer {
@@ -99,9 +114,22 @@ impl ImageRenderer {
                 texture(2),
             ],
         });
+        let labels_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("segmentation labels"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("dicom image"),
-            bind_group_layouts: &[Some(&layout)],
+            bind_group_layouts: &[Some(&layout), Some(&labels_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -168,7 +196,41 @@ impl ImageRenderer {
             curves_made: None,
             tiles: (0, 0),
             show_filtered: false,
+            labels: label_slice(device, &labels_layout, (1, 1)),
+            labels_layout,
         }
+    }
+
+    /// Upload slice `k` of the labels, unless it is already there.
+    fn upload_labels(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        seg: &Segmentation,
+        k: usize,
+    ) {
+        if self.labels.holds == Some((seg.id, k)) {
+            return;
+        }
+        let size = (seg.width, seg.height);
+        if self.labels.size != size {
+            self.labels = label_slice(device, &self.labels_layout, size);
+        }
+        queue.write_texture(
+            self.labels.texture.as_image_copy(),
+            bytemuck::cast_slice(seg.slice(k)),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size.0 * 2),
+                rows_per_image: Some(size.1),
+            },
+            wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.labels.holds = Some((seg.id, k));
     }
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, frame: &Frame) {
@@ -252,6 +314,7 @@ impl ImageRenderer {
         uniforms: Uniforms,
         filters: Filters,
         sigma: f32,
+        labels: Option<(&Segmentation, usize)>,
     ) {
         if self.uploaded != frame.id {
             self.upload(device, queue, frame);
@@ -259,6 +322,11 @@ impl ImageRenderer {
         self.run_filters(device, queue, encoder, frame, filters, sigma);
 
         let mut u = uniforms;
+        u.labels = [0.0; 4];
+        if let Some((seg, k)) = labels.filter(|(s, k)| *k < s.depth as usize) {
+            self.upload_labels(device, queue, seg, k);
+            u.labels = [1.0, seg.width as f32, seg.height as f32, 0.0];
+        }
         if let Some(clip) = contrast::clip_limit(filters.contrast) {
             let window = [u.wl[0], u.wl[1]];
             if self.curves_made != Some((frame.id, window, clip)) {
@@ -362,7 +430,45 @@ impl ImageRenderer {
         };
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, group, &[]);
+        pass.set_bind_group(1, &self.labels.group, &[]);
         pass.draw(0..4, 0..1);
+    }
+}
+
+/// A texture for one slice of labels, of `size`, with its bind group.
+fn label_slice(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    size: (u32, u32),
+) -> LabelSlice {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("segmentation labels"),
+        size: wgpu::Extent3d {
+            width: size.0,
+            height: size.1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R16Uint,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("segmentation labels"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&view),
+        }],
+    });
+    LabelSlice {
+        texture,
+        group,
+        size,
+        holds: None,
     }
 }
 
@@ -402,6 +508,8 @@ pub struct ImageCallback {
     pub filters: Filters,
     /// Sharpening blur, in image pixels.
     pub sigma: f32,
+    /// Segmentation labels to lay over the frame, and which slice of them.
+    pub labels: Option<(Arc<Segmentation>, usize)>,
 }
 
 impl egui_wgpu::CallbackTrait for ImageCallback {
@@ -422,6 +530,7 @@ impl egui_wgpu::CallbackTrait for ImageCallback {
                 self.uniforms,
                 self.filters,
                 self.sigma,
+                self.labels.as_ref().map(|(s, k)| (&**s, *k)),
             );
         }
         Vec::new()
@@ -553,52 +662,17 @@ mod tests {
                     invert as u8 as f32,
                 ],
                 mode: [is_colour as u8 as f32, 1.0, 0.0, colormap.shader_id()],
+                labels: [0.0; 4],
             };
-            let target = device.create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-            let mut encoder = device.create_command_encoder(&Default::default());
-            renderer.prepare(
+            let got = draw(
+                &mut renderer,
                 &device,
                 &queue,
-                &mut encoder,
                 &frame,
                 uniforms,
                 filters,
-                1.0,
+                None,
             );
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: None,
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                renderer.draw(&mut pass);
-            }
-            let got = testing::read(&device, &queue, encoder, &target);
 
             let curves = contrast::clip_limit(filters.contrast)
                 .map(|clip| Curves::new(&frame, window, clip));
@@ -631,5 +705,153 @@ mod tests {
                 mean * 255.0
             );
         }
+    }
+
+    /// Draws a frame to an Rgba8Unorm target of its own size and reads the
+    /// pixels back.
+    fn draw(
+        renderer: &mut ImageRenderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        frame: &Frame,
+        uniforms: Uniforms,
+        filters: Filters,
+        labels: Option<(&Segmentation, usize)>,
+    ) -> Vec<u8> {
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d {
+                width: frame.width,
+                height: frame.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = device.create_command_encoder(&Default::default());
+        renderer.prepare(
+            device,
+            queue,
+            &mut encoder,
+            frame,
+            uniforms,
+            filters,
+            1.0,
+            labels,
+        );
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            renderer.draw(&mut pass);
+        }
+        testing::read(device, queue, encoder, &target)
+    }
+
+    /// Labels tint their regions and outline them, at their own
+    /// resolution, on the right slice. Skipped when there is no GPU.
+    #[test]
+    fn labels_tint_regions_and_outline_their_edges() {
+        let Some((adapter, device, queue)) = testing::gpu() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let mut renderer = ImageRenderer::new(&device, &adapter, wgpu::TextureFormat::Rgba8Unorm);
+        let (w, h) = (64u32, 48u32);
+        let mut frame = gray(w, h, vec![100.0; (w * h) as usize]);
+        frame.id = 1;
+        // Labels at half the image's resolution, two slices; label 2 fills
+        // a block of the second, which covers image pixels 16..32 by 12..24.
+        let (lw, lh) = (32usize, 24usize);
+        let mut voxels = vec![0u16; lw * lh * 2];
+        for y in 6..12 {
+            for x in 8..16 {
+                voxels[lw * lh + y * lw + x] = 2;
+            }
+        }
+        let seg = Segmentation::new(
+            String::new(),
+            String::new(),
+            [lw, lh, 2],
+            voxels,
+            Vec::new(),
+        );
+        let uniforms = Uniforms {
+            rect: [-1.0, 1.0, 1.0, -1.0],
+            tex: [w as f32, h as f32, 0.0, 0.0],
+            wl: [100.0, 200.0, 1.0, 0.0],
+            mode: [0.0, 0.0, 0.0, Colormap::Grey.shader_id()],
+            labels: [0.0; 4],
+        };
+        let grey = [0.5f32; 3];
+        let c = crate::colormap::label_colour(2);
+        let tint: Vec<f32> = (0..3).map(|i| grey[i] + (c[i] - grey[i]) * 0.35).collect();
+        let check = |image: &[u8], x: u32, y: u32, want: &[f32], what: &str| {
+            let i = ((y * w + x) * 4) as usize;
+            for k in 0..3 {
+                let got = image[i + k] as f32 / 255.0;
+                assert!(
+                    (got - want[k]).abs() < 1.5 / 255.0,
+                    "{what} at ({x}, {y}): {:?}, want {want:?}",
+                    &image[i..i + 3]
+                );
+            }
+        };
+
+        let image = draw(
+            &mut renderer,
+            &device,
+            &queue,
+            &frame,
+            uniforms,
+            Filters::default(),
+            Some((&seg, 1)),
+        );
+        check(&image, 24, 18, &tint, "inside");
+        check(&image, 16, 18, &c, "left edge");
+        check(&image, 31, 18, &c, "right edge");
+        check(&image, 24, 12, &c, "top edge");
+        check(&image, 24, 23, &c, "bottom edge");
+        check(&image, 14, 18, &grey, "beside");
+        check(&image, 24, 25, &grey, "below");
+
+        let image = draw(
+            &mut renderer,
+            &device,
+            &queue,
+            &frame,
+            uniforms,
+            Filters::default(),
+            Some((&seg, 0)),
+        );
+        check(&image, 24, 18, &grey, "empty slice");
+        let image = draw(
+            &mut renderer,
+            &device,
+            &queue,
+            &frame,
+            uniforms,
+            Filters::default(),
+            None,
+        );
+        check(&image, 16, 18, &grey, "labels off");
     }
 }

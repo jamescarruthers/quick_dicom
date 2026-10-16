@@ -8,11 +8,13 @@ use eframe::egui::{
 };
 use eframe::egui_wgpu;
 
+use crate::ai;
 use crate::colormap::Colormap;
 use crate::decode::{Frame, Spacing};
 use crate::export::{self, Export};
 use crate::filter::{self, Filters, Level};
 use crate::loader::{Loader, Slot};
+use crate::monai::{self, Connecting, Model, Segmentation, Segmenting};
 use crate::render::{ImageCallback, ImageRenderer, Uniforms};
 use crate::render3d::{Scene, VolumeCallback, VolumeRenderer, VolumeUniforms};
 use crate::scan::{FrameRef, Library, ScanEvent, Scanner, Stack};
@@ -114,6 +116,46 @@ impl Default for ThreeD {
     }
 }
 
+/// The MONAI Label server, its models, and the segmentation it made.
+struct Monai {
+    server: String,
+    connecting: Option<Connecting>,
+    /// The server the models came from.
+    connected: Option<String>,
+    models: Vec<Model>,
+    model: usize,
+    error: Option<String>,
+    job: Option<Segmenting>,
+    /// The built-in model picked, from `ai::MODELS`.
+    builtin: usize,
+    builtin_job: Option<ai::Job>,
+    /// Where built-in models run; chosen when the menu first opens.
+    device: Option<ai::Device>,
+    result: Option<Arc<Segmentation>>,
+    /// Lay the labels over the images and colour them in 3D.
+    show: bool,
+}
+
+impl Default for Monai {
+    fn default() -> Self {
+        Monai {
+            server: std::env::var("QUICK_DICOM_MONAI")
+                .unwrap_or_else(|_| monai::DEFAULT_SERVER.to_string()),
+            connecting: None,
+            connected: None,
+            models: Vec::new(),
+            model: 0,
+            error: None,
+            job: None,
+            builtin: 0,
+            builtin_job: None,
+            device: None,
+            result: None,
+            show: true,
+        }
+    }
+}
+
 pub struct ViewerApp {
     loader: Loader,
     scanner: Option<Scanner>,
@@ -150,6 +192,9 @@ pub struct ViewerApp {
     can_filter: bool,
     /// Set by the 3D renderer when the GPU cannot take a volume.
     gpu_error: Arc<Mutex<Option<String>>>,
+    /// Set by the 3D renderer when the GPU cannot take the labels.
+    gpu_notice: Arc<Mutex<Option<String>>>,
+    monai: Monai,
 }
 
 impl ViewerApp {
@@ -198,6 +243,8 @@ impl ViewerApp {
             max_side: max_3d,
             can_filter,
             gpu_error: Arc::default(),
+            gpu_notice: Arc::default(),
+            monai: Monai::default(),
         };
         if let Some(p) = path {
             app.open(p, &cc.egui_ctx);
@@ -558,6 +605,7 @@ impl ViewerApp {
         let colours = pressed(Key::C);
         let rulers = pressed(Key::M);
         let three_d = pressed(Key::D);
+        let labels = pressed(Key::G);
         let presets = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5].map(&mut pressed);
 
         self.step(forward as i64 - back as i64);
@@ -595,6 +643,9 @@ impl ViewerApp {
         }
         if rulers % 2 == 1 {
             self.view.rulers = !self.view.rulers;
+        }
+        if labels % 2 == 1 && self.monai.result.is_some() {
+            self.monai.show = !self.monai.show;
         }
         if three_d % 2 == 1 && self.can_3d() {
             self.three_d.on = !self.three_d.on;
@@ -730,6 +781,7 @@ impl ViewerApp {
                      window and level, wheel to zoom.",
                 );
             });
+            self.ai_menu(ui);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 // Long messages are cut to fit; egui shows the whole text on hover.
                 ui.add(egui::Label::new(&self.status).truncate());
@@ -790,6 +842,301 @@ impl ViewerApp {
             })
             .0
             .on_hover_text("Denoise (N), sharpen (E) and local contrast (L)");
+    }
+
+    /// The segmentation for the selected stack, when it is shown and fits.
+    fn labels(&self) -> Option<Arc<Segmentation>> {
+        let stack = self.stack()?;
+        self.monai.result.clone().filter(|s| {
+            self.monai.show && s.key == stack.key && s.depth as usize == stack.frames.len()
+        })
+    }
+
+    /// Follow the connection to the MONAI Label server and the segmentation
+    /// it is running.
+    fn tick_monai(&mut self) {
+        let m = &mut self.monai;
+        if let Some(result) = m.connecting.as_ref().and_then(Connecting::poll) {
+            let server = m.connecting.take().expect("polled a connection").server;
+            match result {
+                Ok(models) if models.is_empty() => {
+                    m.error = Some(format!(
+                        "{server} has no models that segment a whole volume by themselves"
+                    ));
+                    m.models.clear();
+                    m.connected = None;
+                }
+                Ok(models) => {
+                    m.models = models;
+                    m.model = 0;
+                    m.connected = Some(server);
+                    m.error = None;
+                }
+                Err(e) => {
+                    m.error = Some(e);
+                    m.models.clear();
+                    m.connected = None;
+                }
+            }
+        }
+        if let Some(job) = &m.job {
+            match job.poll() {
+                Some(Ok(seg)) => {
+                    self.status = match seg.found.len() {
+                        0 => format!("{} found nothing in this series", seg.model),
+                        1 => format!("{}: 1 label found", seg.model),
+                        n => format!("{}: {n} labels found", seg.model),
+                    };
+                    m.result = Some(Arc::new(seg));
+                    m.show = true;
+                    m.job = None;
+                }
+                Some(Err(e)) => {
+                    if e != "cancelled" {
+                        self.status = format!("Segmentation failed: {e}");
+                    }
+                    m.job = None;
+                }
+                None => self.status = job.stage(),
+            }
+        }
+        if let Some(job) = &m.builtin_job {
+            match job.poll() {
+                Some(Ok((seg, seconds, place))) => {
+                    let time = if seconds < 10.0 {
+                        format!("{seconds:.1} s")
+                    } else {
+                        format!("{seconds:.0} s")
+                    };
+                    self.status = match seg.found.len() {
+                        0 => format!(
+                            "{} found nothing in this series ({time} {place})",
+                            seg.model
+                        ),
+                        1 => format!("{}: 1 structure found in {time} {place}", seg.model),
+                        n => format!("{}: {n} structures found in {time} {place}", seg.model),
+                    };
+                    m.result = Some(Arc::new(seg));
+                    m.show = true;
+                    m.builtin_job = None;
+                }
+                Some(Err(e)) => {
+                    if e != "cancelled" {
+                        self.status = format!("Segmentation failed: {e}");
+                    }
+                    m.builtin_job = None;
+                }
+                None => self.status = job.stage(),
+            }
+        }
+        if let Some(n) = self.gpu_notice.lock().unwrap().take() {
+            self.status = format!("3D view without labels: {n}");
+        }
+    }
+
+    /// Segment the selected series with a built-in model or one on a
+    /// MONAI Label server, and show what it found.
+    fn ai_menu(&mut self, ui: &mut egui::Ui) {
+        let stack = self.stack().cloned();
+        let shown = self.labels().is_some();
+        let busy = self.monai.job.is_some() || self.monai.builtin_job.is_some();
+        let button = egui::Button::new("AI").selected(shown || busy);
+        let config = egui::containers::menu::MenuConfig::new()
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        egui::containers::menu::MenuButton::from_button(button)
+            .config(config)
+            .ui(ui, |ui| {
+                ui.set_max_width(420.0);
+                let m = &mut self.monai;
+                ui.strong("Built-in models");
+                for (i, model) in ai::MODELS.iter().enumerate() {
+                    let text = if model.downloaded() {
+                        model.name.to_string()
+                    } else {
+                        format!("{}  ({} MB download)", model.name, model.megabytes)
+                    };
+                    ui.radio_value(&mut m.builtin, i, text)
+                        .on_hover_text(model.about);
+                }
+                // The GPU when there is a real one, else the CPU; a choice
+                // when both are there.
+                let gpu = ai::gpu_name();
+                let device = m.device.get_or_insert(if gpu.is_some() || !ai::CPU {
+                    ai::Device::Gpu
+                } else {
+                    ai::Device::Cpu
+                });
+                if let Some(name) = &gpu
+                    && ai::CPU
+                {
+                    ui.horizontal(|ui| {
+                        ui.label("Run on");
+                        ui.radio_value(device, ai::Device::Gpu, "GPU")
+                            .on_hover_text(name);
+                        ui.radio_value(device, ai::Device::Cpu, "CPU")
+                            .on_hover_text(
+                                "Slower on most computers, but needs no graphics memory",
+                            );
+                    });
+                }
+                match (&m.builtin_job, &stack) {
+                    (Some(job), _) => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.add(egui::Label::new(job.stage()).wrap());
+                        });
+                        if ui.button("Stop").clicked() {
+                            m.builtin_job = None;
+                            self.status = "Segmentation stopped".into();
+                        }
+                    }
+                    (None, Some(stack)) => {
+                        if ui
+                            .button("Segment this series")
+                            .on_hover_text(
+                                "Run the model on this computer. The first run downloads it \
+                                 from MONAI's page on Hugging Face.",
+                            )
+                            .clicked()
+                        {
+                            let model = &ai::MODELS[m.builtin];
+                            let device = m.device.unwrap_or(ai::Device::Cpu);
+                            m.builtin_job =
+                                Some(ai::Job::start(stack, model, device, ui.ctx().clone()));
+                        }
+                    }
+                    (None, None) => {
+                        ui.weak("Select a series to segment.");
+                    }
+                }
+                ui.separator();
+                egui::CollapsingHeader::new("MONAI Label server")
+                    .default_open(m.connected.is_some())
+                    .show(ui, |ui| {
+                        Self::server_section(m, ui, stack.as_deref(), &mut self.status);
+                    });
+                let Some(seg) = m.result.clone() else {
+                    return;
+                };
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut m.show, "Show labels")
+                        .on_hover_text("G: lay the labels over the images, and colour them in 3D");
+                    if ui.button("Clear").clicked() {
+                        m.result = None;
+                    }
+                });
+                if stack.as_ref().is_none_or(|s| s.key != seg.key) {
+                    ui.weak(format!(
+                        "The labels from {} belong to another series.",
+                        seg.model
+                    ));
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .min_scrolled_height(200.0)
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        for &id in &seg.found {
+                            let [r, g, b] =
+                                crate::colormap::label_colour(id).map(|c| (c * 255.0) as u8);
+                            ui.horizontal(|ui| {
+                                let (swatch, _) =
+                                    ui.allocate_exact_size(Vec2::splat(12.0), egui::Sense::hover());
+                                ui.painter()
+                                    .rect_filled(swatch, 2.0, Color32::from_rgb(r, g, b));
+                                ui.label(seg.name(id));
+                            });
+                        }
+                        if seg.found.is_empty() {
+                            ui.weak("No labels were found in this series.");
+                        }
+                    });
+            })
+            .0
+            .on_hover_text("Segment the series with an AI model");
+    }
+
+    /// Connect to a MONAI Label server, pick one of its models, and send it
+    /// the series.
+    fn server_section(
+        m: &mut Monai,
+        ui: &mut egui::Ui,
+        stack: Option<&Stack>,
+        status: &mut String,
+    ) {
+        ui.horizontal(|ui| {
+            ui.label("Server");
+            ui.add(egui::TextEdit::singleline(&mut m.server).desired_width(220.0));
+            let busy = m.connecting.is_some();
+            if ui
+                .add_enabled(!busy, egui::Button::new("Connect"))
+                .clicked()
+            {
+                m.connecting = Some(Connecting::start(
+                    m.server.trim().to_string(),
+                    ui.ctx().clone(),
+                ));
+                m.error = None;
+            }
+            if busy {
+                ui.spinner();
+            }
+        });
+        if let Some(e) = &m.error {
+            ui.colored_label(Color32::from_rgb(255, 140, 120), e);
+        }
+        if m.connected.is_none() {
+            ui.weak(
+                "For other models, or a GPU on another machine, run a MONAI Label \
+                 server and connect to it. For example:",
+            );
+            // Read-only, so the command can be selected and copied.
+            let mut command = "monailabel start_server --app apps/radiology \\\n  --studies data --conf models segmentation";
+            ui.add(
+                egui::TextEdit::multiline(&mut command)
+                    .code_editor()
+                    .desired_rows(2)
+                    .desired_width(f32::INFINITY),
+            );
+            return;
+        }
+        for (i, model) in m.models.iter().enumerate() {
+            let text = match model.labels.len() {
+                1 => format!("{}  (1 label)", model.name),
+                n => format!("{}  ({n} labels)", model.name),
+            };
+            ui.radio_value(&mut m.model, i, text)
+                .on_hover_text(&model.description);
+        }
+        match (&m.job, stack) {
+            (Some(job), _) => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.add(egui::Label::new(job.stage()).wrap());
+                });
+                if ui.button("Stop waiting").clicked() {
+                    m.job = None;
+                    *status = "Stopped waiting for the server".into();
+                }
+            }
+            (None, Some(stack)) => {
+                let model = m.models.get(m.model).cloned();
+                let server = m.connected.clone().unwrap_or_default();
+                if ui
+                    .add_enabled(model.is_some(), egui::Button::new("Send this series"))
+                    .on_hover_text(
+                        "Send the whole series to the server and show the labels it \
+                         finds. Models take seconds on a GPU, minutes on a CPU.",
+                    )
+                    .clicked()
+                    && let Some(model) = model
+                {
+                    m.job = Some(Segmenting::start(stack, server, model, ui.ctx().clone()));
+                }
+            }
+            (None, None) => {}
+        }
     }
 
     fn bottom_bar(&mut self, ui: &mut egui::Ui) {
@@ -1116,6 +1463,7 @@ impl ViewerApp {
                 0.0,
                 self.view.colormap.shader_id(),
             ],
+            labels: [0.0; 4],
         };
         painter.add(egui_wgpu::Callback::new_paint_callback(
             rect,
@@ -1124,6 +1472,7 @@ impl ViewerApp {
                 uniforms,
                 filters: self.view.filters,
                 sigma: filter::sigma_for(scale * ui.ctx().pixels_per_point()),
+                labels: self.labels().map(|s| (s, self.index)),
             },
         ));
 
@@ -1144,16 +1493,24 @@ impl ViewerApp {
             );
         }
 
+        let labels = self.labels();
         let probe = resp.hover_pos().and_then(|p| {
             let x = ((p.x - img.left()) / scale).floor();
             let y = ((p.y - img.top()) / scale).floor();
-            (x >= 0.0 && y >= 0.0)
-                .then(|| {
-                    frame
-                        .value_at(x as u32, y as u32)
-                        .map(|v| format!("({x}, {y})  {v}"))
-                })
-                .flatten()
+            if x < 0.0 || y < 0.0 {
+                return None;
+            }
+            let mut text = format!("({x}, {y})  {}", frame.value_at(x as u32, y as u32)?);
+            // The label there, if any; labels may be larger than the frame.
+            if let Some(seg) = &labels {
+                let lx = (x * seg.width as f32 / w) as u32;
+                let ly = (y * seg.height as f32 / h) as u32;
+                let id = seg.at(lx, ly, self.index as u32);
+                if id > 0 {
+                    text.push_str(&format!("  ·  {}", seg.name(id)));
+                }
+            }
+            Some(text)
         });
         let mut info = format!("{} × {}", frame.width, frame.height);
         if let Some(sp) = frame.spacing {
@@ -1165,6 +1522,9 @@ impl ViewerApp {
             wc,
             scale * ui.ctx().pixels_per_point() * 100.0
         ));
+        if let Some(seg) = &labels {
+            info.push_str(&format!("\nLabels: {}", seg.model));
+        }
         self.overlay_text(&painter, rect, &stack, Some(info), probe, font, text_color);
     }
 
@@ -1322,6 +1682,8 @@ impl ViewerApp {
                 uniforms,
                 size_px,
                 error: self.gpu_error.clone(),
+                labels: self.labels(),
+                notice: self.gpu_notice.clone(),
             },
         ));
 
@@ -1409,6 +1771,7 @@ impl eframe::App for ViewerApp {
         }
         self.handle_keys(&ctx);
         self.tick_3d(&ctx);
+        self.tick_monai();
         self.tick_playback(&ctx);
         self.update_requests();
 

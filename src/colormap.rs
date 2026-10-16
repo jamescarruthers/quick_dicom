@@ -12,6 +12,18 @@ pub enum Colormap {
     Rainbow,
 }
 
+/// The colour of segmentation label `id`: hues a golden-ratio turn apart,
+/// so labels with neighbouring numbers look different. Twin of
+/// `label_colour` in `common.wgsl`.
+pub fn label_colour(id: u16) -> [f32; 3] {
+    let h = (id as f32 * 0.618_034).fract();
+    let k = |n: f32| {
+        let k = (n + h * 6.0) % 6.0;
+        1.0 - 0.65 * k.min(4.0 - k).clamp(0.0, 1.0)
+    };
+    [k(5.0), k(3.0), k(1.0)]
+}
+
 /// Evenly spaced stops of the rainbow map, from 0 to 1.
 const RAINBOW: [[f32; 3]; 8] = [
     [0.0, 0.0, 0.0],

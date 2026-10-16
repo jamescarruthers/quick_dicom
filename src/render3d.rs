@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui_wgpu::{self, wgpu};
 
+use crate::monai::Segmentation;
 use crate::volume::Volume;
 
 #[repr(C)]
@@ -23,6 +24,9 @@ pub struct VolumeUniforms {
     pub slices: [f32; 4],
     pub wl: [f32; 4],
     pub look: [f32; 4],
+    /// Segmentation labels shown (0 or 1), and every how many of the
+    /// labels' slices the volume took one. Set by the renderer.
+    pub labels: [f32; 4],
 }
 
 /// What the 3D view shows, and from where.
@@ -87,6 +91,7 @@ impl VolumeUniforms {
                 0.0,
                 scene.shading as u8 as f32,
             ],
+            labels: [0.0; 4],
         }
     }
 }
@@ -120,6 +125,12 @@ pub struct VolumeRenderer {
     format: wgpu::TextureFormat,
     /// Binds the volume's 3D texture for the ray pass.
     volume: Option<wgpu::BindGroup>,
+    labels_layout: wgpu::BindGroupLayout,
+    /// The segmentation labels as a 3D texture, or a single empty voxel.
+    labels: wgpu::BindGroup,
+    /// Which segmentation `labels` holds, or failed to hold.
+    labels_for: Option<u64>,
+    labels_ok: bool,
     /// The volume on the GPU, to tell when a new one needs uploading.
     uploaded: Option<Arc<Volume>>,
     offscreen: Option<Offscreen>,
@@ -189,6 +200,19 @@ impl VolumeRenderer {
                 sampler_entry(2),
             ],
         });
+        let labels_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("volume labels"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
         let composite_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("volume composite"),
             entries: &[
@@ -198,45 +222,56 @@ impl VolumeRenderer {
             ],
         });
 
-        let pipeline =
-            |layout: &wgpu::BindGroupLayout, vs: &str, fs: &str, format: wgpu::TextureFormat| {
-                let pipeline_layout =
-                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("dicom volume"),
-                        bind_group_layouts: &[Some(layout)],
-                        immediate_size: 0,
-                    });
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some(fs),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &module,
-                        entry_point: Some(vs),
-                        buffers: &[],
-                        compilation_options: Default::default(),
-                    },
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleStrip,
-                        ..Default::default()
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    fragment: Some(wgpu::FragmentState {
-                        module: &module,
-                        entry_point: Some(fs),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    multiview_mask: None,
-                    cache: None,
-                })
-            };
-        let ray = pipeline(&ray_layout, "vs_ray", "fs_ray", format);
-        let composite = pipeline(&composite_layout, "vs_composite", "fs_composite", target);
+        let pipeline = |layouts: &[Option<&wgpu::BindGroupLayout>],
+                        vs: &str,
+                        fs: &str,
+                        format: wgpu::TextureFormat| {
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("dicom volume"),
+                bind_group_layouts: layouts,
+                immediate_size: 0,
+            });
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(fs),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &module,
+                    entry_point: Some(vs),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &module,
+                    entry_point: Some(fs),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let ray = pipeline(
+            &[Some(&ray_layout), Some(&labels_layout)],
+            "vs_ray",
+            "fs_ray",
+            format,
+        );
+        let composite = pipeline(
+            &[Some(&composite_layout)],
+            "vs_composite",
+            "fs_composite",
+            target,
+        );
 
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("volume uniforms"),
@@ -263,6 +298,16 @@ impl VolumeRenderer {
             sampler,
             format,
             volume: None,
+            labels: label_volume(
+                device,
+                &labels_layout,
+                [1, 1, 1],
+                wgpu::TextureFormat::R8Uint,
+            )
+            .1,
+            labels_layout,
+            labels_for: None,
+            labels_ok: false,
             uploaded: None,
             offscreen: None,
             drawn: None,
@@ -416,8 +461,78 @@ impl VolumeRenderer {
         });
     }
 
-    /// Upload the volume if it is new, then cast the rays if the view has
-    /// changed. An upload that fails is reported once and not retried.
+    /// Put segmentation labels on the GPU as a 3D texture, as bytes when
+    /// every label fits in one. Fails, rather than crashing, when the GPU
+    /// has no room for them.
+    fn upload_labels(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        seg: &Segmentation,
+    ) -> Result<(), String> {
+        self.labels_for = Some(seg.id);
+        self.labels_ok = false;
+        self.drawn = None;
+        let wide = seg.max_label() > 255;
+        let format = if wide {
+            wgpu::TextureFormat::R16Uint
+        } else {
+            wgpu::TextureFormat::R8Uint
+        };
+        let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let (texture, group) = label_volume(
+            device,
+            &self.labels_layout,
+            [seg.width, seg.height, seg.depth],
+            format,
+        );
+        for k in 0..seg.depth as usize {
+            let slice = seg.slice(k);
+            let bytes: Vec<u8> = if wide {
+                bytemuck::cast_slice(slice).to_vec()
+            } else {
+                slice.iter().map(|&v| v as u8).collect()
+            };
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: 0,
+                        y: 0,
+                        z: k as u32,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(seg.width * if wide { 2 } else { 1 }),
+                    rows_per_image: Some(seg.height),
+                },
+                wgpu::Extent3d {
+                    width: seg.width,
+                    height: seg.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        let invalid = pollster::block_on(validation.pop());
+        let out_of_memory = pollster::block_on(memory.pop());
+        if out_of_memory.is_some() || invalid.is_some() {
+            self.labels = label_volume(device, &self.labels_layout, [1, 1, 1], format).1;
+            return Err("the GPU has no room for the segmentation in 3D".into());
+        }
+        self.labels = group;
+        self.labels_ok = true;
+        Ok(())
+    }
+
+    /// Upload the volume and labels if they are new, then cast the rays if
+    /// the view has changed. An upload that fails is reported once and not
+    /// retried; a volume that fails is an error, labels that fail a notice.
+    #[allow(clippy::too_many_arguments)]
     fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -426,8 +541,10 @@ impl VolumeRenderer {
         volume: &Arc<Volume>,
         uniforms: VolumeUniforms,
         size: (u32, u32),
-    ) -> Result<(), String> {
+        labels: Option<&Segmentation>,
+    ) -> (Result<(), String>, Option<String>) {
         let mut result = Ok(());
+        let mut notice = None;
         if self
             .uploaded
             .as_ref()
@@ -435,16 +552,25 @@ impl VolumeRenderer {
         {
             result = self.upload(device, queue, volume);
         }
+        if let Some(seg) = labels
+            && self.labels_for != Some(seg.id)
+            && let Err(e) = self.upload_labels(device, queue, seg)
+        {
+            notice = Some(e);
+        }
         self.ensure_offscreen(device, size);
         let mut u = uniforms;
         u.look[2] = if self.srgb_target { 1.0 } else { 0.0 };
+        if labels.is_some() && self.labels_ok {
+            u.labels = [1.0, volume.stride as f32, 0.0, 0.0];
+        }
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 
         let (Some(group), Some(offscreen)) = (&self.volume, &self.offscreen) else {
-            return result;
+            return (result, notice);
         };
         if self.drawn == Some(u) {
-            return result;
+            return (result, notice);
         }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("volume rays"),
@@ -464,10 +590,11 @@ impl VolumeRenderer {
         });
         pass.set_pipeline(&self.ray);
         pass.set_bind_group(0, group, &[]);
+        pass.set_bind_group(1, &self.labels, &[]);
         pass.draw(0..3, 0..1);
         drop(pass);
         self.drawn = Some(u);
-        result
+        (result, notice)
     }
 
     fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
@@ -483,9 +610,47 @@ impl VolumeRenderer {
     }
 }
 
+/// A 3D texture of labels, R8Uint or R16Uint, with its bind group. A new
+/// texture is all zeros.
+fn label_volume(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    size: [u32; 3],
+    format: wgpu::TextureFormat,
+) -> (wgpu::Texture, wgpu::BindGroup) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("volume labels"),
+        size: wgpu::Extent3d {
+            width: size[0],
+            height: size[1],
+            depth_or_array_layers: size[2],
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("volume labels"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&view),
+        }],
+    });
+    (texture, group)
+}
+
 /// One frame of the 3D view.
 pub struct VolumeCallback {
     pub volume: Arc<Volume>,
+    /// Segmentation labels to colour the volume with.
+    pub labels: Option<Arc<Segmentation>>,
+    /// Where to report labels the GPU could not take.
+    pub notice: Arc<Mutex<Option<String>>>,
     pub uniforms: VolumeUniforms,
     /// Size of the offscreen image in pixels: the view's, or half that
     /// while it moves.
@@ -509,15 +674,20 @@ impl egui_wgpu::CallbackTrait for VolumeCallback {
         if self.size_px.0 == 0 || self.size_px.1 == 0 {
             return Vec::new();
         }
-        if let Err(e) = r.prepare(
+        let (result, notice) = r.prepare(
             device,
             queue,
             encoder,
             &self.volume,
             self.uniforms,
             self.size_px,
-        ) {
+            self.labels.as_deref(),
+        );
+        if let Err(e) = result {
             *self.error.lock().unwrap() = Some(e);
+        }
+        if let Some(n) = notice {
+            *self.notice.lock().unwrap() = Some(n);
         }
         Vec::new()
     }
@@ -594,6 +764,21 @@ mod tests {
         volume: &Arc<Volume>,
         scene: &Scene,
     ) -> Vec<u8> {
+        render_rgba(renderer, device, queue, volume, scene, None)
+            .iter()
+            .map(|p| p[1])
+            .collect()
+    }
+
+    /// Casts the rays, with labels if given, and returns the screen.
+    fn render_rgba(
+        renderer: &mut VolumeRenderer,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        volume: &Arc<Volume>,
+        scene: &Scene,
+        labels: Option<&Segmentation>,
+    ) -> Vec<[u8; 4]> {
         let uniforms = VolumeUniforms::new(scene, 32.0, 32.0, 32.0);
         let target = device.create_texture(&wgpu::TextureDescriptor {
             label: None,
@@ -612,7 +797,16 @@ mod tests {
         let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = device.create_command_encoder(&Default::default());
         renderer
-            .prepare(device, queue, &mut encoder, volume, uniforms, (64, 64))
+            .prepare(
+                device,
+                queue,
+                &mut encoder,
+                volume,
+                uniforms,
+                (64, 64),
+                labels,
+            )
+            .0
             .expect("the volume uploads");
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -634,7 +828,7 @@ mod tests {
             renderer.draw(&mut pass);
         }
         let rgba = testing::read(device, queue, encoder, &target);
-        rgba.as_chunks::<4>().0.iter().map(|p| p[1]).collect()
+        rgba.as_chunks::<4>().0.to_vec()
     }
 
     /// The ray caster sees the cube from any side, with its edges where
@@ -710,5 +904,69 @@ mod tests {
         };
         let image = render(&mut renderer, &device, &queue, &volume, &beside);
         assert!(at(&image, 32, 32) < 20, "slice beside the cube");
+    }
+
+    /// Labelled voxels show solid in their label's colour, where the
+    /// geometry puts them, even where the scan is dark; the rest of the
+    /// scan fades. Skipped when there is no GPU.
+    #[test]
+    fn labels_colour_the_volume() {
+        let Some((adapter, device, queue)) = testing::gpu() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let mut renderer = VolumeRenderer::new(&device, &adapter, wgpu::TextureFormat::Rgba8Unorm);
+        let volume = cube();
+        // Labels at twice the volume's resolution across, every slice:
+        // label 3 fills volume voxels 2..8 across and down, in the dark
+        // part of the scan, which is screen pixels 11 to 20.
+        let (n, d) = (64usize, 32usize);
+        let mut voxels = vec![0u16; n * n * d];
+        for z in 0..d {
+            for y in 4..16 {
+                for x in 4..16 {
+                    voxels[(z * n + y) * n + x] = 3;
+                }
+            }
+        }
+        let seg = Segmentation::new(String::new(), String::new(), [n, n, d], voxels, Vec::new());
+        let c = crate::colormap::label_colour(3).map(|v| v * 255.0);
+        let is_label = |p: [u8; 4]| (0..3).all(|k| (p[k] as f32 - c[k]).abs() < 3.0);
+
+        for (scene, what) in [
+            (scene(), "face on"),
+            (
+                Scene {
+                    pitch: 0.3,
+                    shading: true,
+                    ..scene()
+                },
+                "tilted and shaded",
+            ),
+        ] {
+            let image = render_rgba(&mut renderer, &device, &queue, &volume, &scene, Some(&seg));
+            let at = |x: usize, y: usize| image[y * 64 + x];
+            if !scene.shading {
+                assert!(
+                    is_label(at(15, 15)),
+                    "{what}: label {:?}, want {c:?}",
+                    at(15, 15)
+                );
+            } else {
+                assert!(at(15, 15)[0] > 40, "{what}: label {:?}", at(15, 15));
+            }
+            assert!(
+                at(24, 15)[1] < 10,
+                "{what}: beside the label {:?}",
+                at(24, 15)
+            );
+            // The bright cube, unlabelled, is only a faint presence.
+            let faint = at(32, 32)[1];
+            assert!(faint > 5 && faint < 70, "{what}: unlabelled cube {faint}");
+        }
+
+        // Without labels the dark corner stays dark.
+        let image = render_rgba(&mut renderer, &device, &queue, &volume, &scene(), None);
+        assert!(image[15 * 64 + 15][1] < 10, "labels off");
     }
 }
