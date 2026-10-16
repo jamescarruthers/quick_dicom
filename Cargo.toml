@@ -32,9 +32,10 @@ sha2 = "0.10"
 ureq = "3"
 walkdir = "2.5.0"
 
-# Runs the built-in AI models on the CPU. There is no ONNX Runtime build for
-# Intel Macs; they use the GPU instead.
-[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
+# Runs the built-in AI models on the CPU, on Linux and Windows. ONNX
+# Runtime's Mac library needs macOS 13.4 and has no Intel build, so Macs
+# run the models on the GPU.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
 ort = { version = "=2.0.0-rc.14", default-features = false, features = [
     "std",
     "download-binaries",

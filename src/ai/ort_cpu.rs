@@ -1,5 +1,6 @@
-//! Runs a network with ONNX Runtime on the CPU. ONNX Runtime publishes no
-//! build for Intel Macs, which use the GPU instead.
+//! Runs a network with ONNX Runtime on the CPU, on Linux and Windows.
+//! Macs use the GPU instead: ONNX Runtime's Mac library needs macOS 13.4,
+//! and there is none for Intel Macs.
 
 use std::sync::OnceLock;
 

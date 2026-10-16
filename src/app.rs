@@ -129,6 +129,8 @@ struct Monai {
     /// The built-in model picked, from `ai::MODELS`.
     builtin: usize,
     builtin_job: Option<ai::Job>,
+    /// Where built-in models run; chosen when the menu first opens.
+    device: Option<ai::Device>,
     result: Option<Arc<Segmentation>>,
     /// Lay the labels over the images and colour them in 3D.
     show: bool,
@@ -147,6 +149,7 @@ impl Default for Monai {
             job: None,
             builtin: 0,
             builtin_job: None,
+            device: None,
             result: None,
             show: true,
         }
@@ -899,14 +902,19 @@ impl ViewerApp {
         }
         if let Some(job) = &m.builtin_job {
             match job.poll() {
-                Some(Ok((seg, seconds))) => {
+                Some(Ok((seg, seconds, place))) => {
+                    let time = if seconds < 10.0 {
+                        format!("{seconds:.1} s")
+                    } else {
+                        format!("{seconds:.0} s")
+                    };
                     self.status = match seg.found.len() {
                         0 => format!(
-                            "{} found nothing in this series ({seconds:.0} s)",
+                            "{} found nothing in this series ({time} {place})",
                             seg.model
                         ),
-                        1 => format!("{}: 1 structure found in {seconds:.0} s", seg.model),
-                        n => format!("{}: {n} structures found in {seconds:.0} s", seg.model),
+                        1 => format!("{}: 1 structure found in {time} {place}", seg.model),
+                        n => format!("{}: {n} structures found in {time} {place}", seg.model),
                     };
                     m.result = Some(Arc::new(seg));
                     m.show = true;
@@ -950,6 +958,27 @@ impl ViewerApp {
                     ui.radio_value(&mut m.builtin, i, text)
                         .on_hover_text(model.about);
                 }
+                // The GPU when there is a real one, else the CPU; a choice
+                // when both are there.
+                let gpu = ai::gpu_name();
+                let device = m.device.get_or_insert(if gpu.is_some() || !ai::CPU {
+                    ai::Device::Gpu
+                } else {
+                    ai::Device::Cpu
+                });
+                if let Some(name) = &gpu
+                    && ai::CPU
+                {
+                    ui.horizontal(|ui| {
+                        ui.label("Run on");
+                        ui.radio_value(device, ai::Device::Gpu, "GPU")
+                            .on_hover_text(name);
+                        ui.radio_value(device, ai::Device::Cpu, "CPU")
+                            .on_hover_text(
+                                "Slower on most computers, but needs no graphics memory",
+                            );
+                    });
+                }
                 match (&m.builtin_job, &stack) {
                     (Some(job), _) => {
                         ui.horizontal(|ui| {
@@ -971,7 +1000,9 @@ impl ViewerApp {
                             .clicked()
                         {
                             let model = &ai::MODELS[m.builtin];
-                            m.builtin_job = Some(ai::Job::start(stack, model, ui.ctx().clone()));
+                            let device = m.device.unwrap_or(ai::Device::Cpu);
+                            m.builtin_job =
+                                Some(ai::Job::start(stack, model, device, ui.ctx().clone()));
                         }
                     }
                     (None, None) => {

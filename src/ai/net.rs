@@ -579,7 +579,6 @@ pub fn run_cpu(net: &Net, input: &[f32], size: [usize; 3]) -> Vec<f32> {
 }
 
 /// The layers an op reads.
-#[cfg(test)]
 pub fn inputs(op: &Op) -> Vec<Id> {
     match op {
         Op::Input => vec![],

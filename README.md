@@ -245,15 +245,20 @@ on macOS, `%LOCALAPPDATA%\quick_dicom\models` on Windows; set
 `QUICK_DICOM_MODELS` to use another). Later runs need no network. The
 series never leaves the computer.
 
-The viewer reads the PyTorch weights itself, rebuilds MONAI's network, and
-runs it with [ONNX Runtime](https://onnxruntime.ai) on the CPU. It prepares
-the scan as MONAI's own code does: it turns it to the patient's axes,
-resamples it to the model's voxel size, scales its values, runs the model on
-overlapping 96-voxel cubes and blends them. On a real CT its labels match
-MONAI's own output voxel for voxel for the spleen and the quick model, and
-to a Dice score of 0.997 for the detailed one, which keeps only each voxel's
-four best classes to save memory. Built-in models do not run on Intel Macs
-yet: ONNX Runtime publishes no build for them.
+**Run on** picks the GPU or the CPU. The GPU runs the model with the
+viewer's own compute shaders, through Vulkan, Metal or DirectX 12; the CPU
+runs it with [ONNX Runtime](https://onnxruntime.ai). The GPU is the default
+when there is one. Macs always use the GPU: ONNX Runtime's Mac library
+needs macOS 13.4 and has no Intel build. How fast the GPU is depends on the
+card; the status line gives the time each run took and where it ran.
+
+The viewer reads the PyTorch weights itself and rebuilds MONAI's network.
+It prepares the scan as MONAI's own code does: it turns it to the patient's
+axes, resamples it to the model's voxel size, scales its values, runs the
+model on overlapping 96-voxel cubes and blends them. On a real CT its
+labels match MONAI's own output voxel for voxel for the spleen and the
+quick model, and to a Dice score of 0.997 for the detailed one, which keeps
+only each voxel's four best classes to save memory.
 
 The weights are MONAI's (Apache 2.0). The spleen model learned from the
 [Medical Segmentation Decathlon](http://medicaldecathlon.com/) (CC BY-SA
@@ -370,7 +375,7 @@ example `QUICK_DICOM_CACHE_MB=8000 quick_dicom /scans`.
 | `src/volume.rs`    | Builds the 3D volume in the background: decodes every slice, keeps raw values as 16-bit floats, and works out the gap between slices from their positions.  |
 | `src/render3d.rs`  | Puts the volume on the GPU as one 3D texture, casts the rays into an offscreen image when the view changes, then puts that image on screen.                  |
 | `src/volume.wgsl`  | The 3D shaders: marches each ray through the volume front to back, applying window, colour map, opacity and lighting, or keeps the brightest value for MIP. Colours AI labels. |
-| `src/ai/`          | The built-in models: `torch.rs` reads PyTorch weights, `net.rs` rebuilds MONAI's UNet and SegResNet, `onnx.rs` and `ort_cpu.rs` run them with ONNX Runtime, `pipeline.rs` prepares the scan and blends the cubes, `mod.rs` lists the models and downloads them. |
+| `src/ai/`          | The built-in models: `torch.rs` reads PyTorch weights, `net.rs` rebuilds MONAI's UNet and SegResNet, `gpu.rs` and `gpu.wgsl` run them on the GPU, `onnx.rs` and `ort_cpu.rs` with ONNX Runtime, `pipeline.rs` prepares the scan and blends the cubes, `mod.rs` lists the models and downloads them. |
 | `src/monai.rs`     | Talks to a MONAI Label server on a background thread: lists its models, reads the series at full resolution, sends it, and reads back the labels.           |
 | `src/nifti.rs`     | Writes the series as a NIfTI volume, with its position in the patient taken from the DICOM slice positions, and reads the labels the server returns.       |
 | `src/colormap.rs`  | The colour maps, with twins in `src/common.wgsl` for the GPU.                                                                                               |

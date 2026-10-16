@@ -2,9 +2,11 @@
 //! their PyTorch weights, which are downloaded once, and run without
 //! Python.
 
+pub mod gpu;
 pub mod net;
+#[cfg(not(target_os = "macos"))]
 pub mod onnx;
-#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+#[cfg(not(target_os = "macos"))]
 pub mod ort_cpu;
 pub mod pipeline;
 pub mod torch;
@@ -269,27 +271,76 @@ pub trait Engine: Send {
     fn logits(&mut self, cube: &[f32], side: usize) -> Result<Vec<f32>, String>;
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+impl Engine for gpu::GpuNet {
+    fn logits(&mut self, cube: &[f32], side: usize) -> Result<Vec<f32>, String> {
+        gpu::GpuNet::logits(self, cube, side)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 impl Engine for ort_cpu::OrtNet {
     fn logits(&mut self, cube: &[f32], side: usize) -> Result<Vec<f32>, String> {
         ort_cpu::OrtNet::logits(self, cube, [side; 3])
     }
 }
 
-#[allow(unused_variables)]
-fn engine(net: &Net) -> Result<Box<dyn Engine>, String> {
-    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
-    {
-        Ok(Box::new(ort_cpu::OrtNet::new(net)?))
-    }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        Err("built-in models do not run on Intel Macs yet".into())
+/// Where a model runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Device {
+    Gpu,
+    Cpu,
+}
+
+/// Whether ONNX Runtime is built in: on Linux and Windows.
+pub const CPU: bool = cfg!(not(target_os = "macos"));
+
+/// The name of the GPU the models would run on, if there is one that is
+/// not a software stand-in. Looked for once.
+pub fn gpu_name() -> Option<String> {
+    static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let instance =
+            eframe::egui_wgpu::wgpu::Instance::new(eframe::egui_wgpu::wgpu::InstanceDescriptor {
+                backends: eframe::egui_wgpu::wgpu::Backends::PRIMARY,
+                ..eframe::egui_wgpu::wgpu::InstanceDescriptor::new_without_display_handle()
+            });
+        let options = eframe::egui_wgpu::wgpu::RequestAdapterOptions {
+            power_preference: eframe::egui_wgpu::wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        };
+        let adapter = pollster::block_on(instance.request_adapter(&options)).ok()?;
+        let info = adapter.get_info();
+        // QUICK_DICOM_SOFTWARE_GPU lets a software GPU stand in, for tests.
+        let software = std::env::var_os("QUICK_DICOM_SOFTWARE_GPU").is_some();
+        (info.device_type != eframe::egui_wgpu::wgpu::DeviceType::Cpu || software)
+            .then_some(info.name)
+    })
+    .clone()
+}
+
+/// An engine for `net` on `device`, and where it runs, for messages.
+fn engine(net: &Net, device: Device) -> Result<(Box<dyn Engine>, String), String> {
+    match device {
+        Device::Gpu => {
+            let software = std::env::var_os("QUICK_DICOM_SOFTWARE_GPU").is_some();
+            let g = gpu::GpuNet::new(net, software)?;
+            let place = format!("on {}", g.adapter);
+            Ok((Box::new(g), place))
+        }
+        #[cfg(not(target_os = "macos"))]
+        Device::Cpu => Ok((
+            Box::new(ort_cpu::OrtNet::new(net)?),
+            "on the CPU".to_string(),
+        )),
+        #[cfg(target_os = "macos")]
+        Device::Cpu => Err("on a Mac the models run on the GPU".into()),
     }
 }
 
-/// The last engine built, kept for the next run of the same model.
-static LAST: Mutex<Option<(&'static str, Box<dyn Engine>)>> = Mutex::new(None);
+/// The last engine built, kept for the next run of the same model on the
+/// same device: the model, the device, the engine and where it runs.
+type Kept = (&'static str, Device, Box<dyn Engine>, String);
+static LAST: Mutex<Option<Kept>> = Mutex::new(None);
 
 /// Labels for the scan's voxels, in its own order.
 pub fn segment(
@@ -317,8 +368,11 @@ pub fn segment(
 pub struct Job {
     stage: Arc<Mutex<String>>,
     cancel: Arc<AtomicBool>,
-    result: Receiver<Result<(Segmentation, f32), String>>,
+    result: Receiver<Result<Done, String>>,
 }
+
+/// A finished segmentation, the seconds the model took, and where it ran.
+pub type Done = (Segmentation, f32, String);
 
 impl Drop for Job {
     fn drop(&mut self) {
@@ -327,7 +381,12 @@ impl Drop for Job {
 }
 
 impl Job {
-    pub fn start(stack: &Stack, model: &'static Model, ctx: eframe::egui::Context) -> Job {
+    pub fn start(
+        stack: &Stack,
+        model: &'static Model,
+        device: Device,
+        ctx: eframe::egui::Context,
+    ) -> Job {
         let frames = stack.frames.clone();
         let key = stack.key.clone();
         let stage = Arc::new(Mutex::new(format!("Starting {}…", model.name)));
@@ -348,11 +407,13 @@ impl Job {
                         say(format!("Reading slices… {n} / {total}"))
                     })?;
                     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
-                    let mut engine = match last.take() {
-                        Some((name, e)) if name == model.name => e,
+                    let (mut engine, place) = match last.take() {
+                        Some((name, d, e, place)) if name == model.name && d == device => {
+                            (e, place)
+                        }
                         _ => {
                             say(format!("Preparing the {} model…", model.name));
-                            engine(&model.build(&bytes)?)?
+                            engine(&model.build(&bytes)?, device)?
                         }
                     };
                     let start = std::time::Instant::now();
@@ -364,7 +425,7 @@ impl Job {
                         ));
                     };
                     let voxels = segment(&scan, model, engine.as_mut(), &c, &mut progress);
-                    *last = Some((model.name, engine));
+                    *last = Some((model.name, device, engine, place.clone()));
                     let seconds = start.elapsed().as_secs_f32();
                     let seg = Segmentation::new(
                         key,
@@ -373,7 +434,7 @@ impl Job {
                         voxels?,
                         model.names(),
                     );
-                    Ok((seg, seconds))
+                    Ok((seg, seconds, place))
                 })();
                 let _ = tx.send(out);
                 ctx.request_repaint();
@@ -390,8 +451,9 @@ impl Job {
         self.stage.lock().unwrap().clone()
     }
 
-    /// The segmentation and the seconds the model took, once done.
-    pub fn poll(&self) -> Option<Result<(Segmentation, f32), String>> {
+    /// The segmentation, the seconds the model took and where it ran,
+    /// once done.
+    pub fn poll(&self) -> Option<Result<Done, String>> {
         self.result.try_recv().ok()
     }
 }
@@ -429,7 +491,7 @@ mod tests {
     /// spleen.pt, wholebody_3mm.pt, wholebody.pt) and `AI_BUNDLE_OUT` the
     /// bundles' label files (spleen/, wb3/, wb15/). Run with
     /// `cargo test --release models_match_monai -- --ignored --nocapture`.
-    #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+    #[cfg(not(target_os = "macos"))]
     #[test]
     #[ignore]
     fn models_match_monai_on_a_real_scan() {
@@ -455,7 +517,14 @@ mod tests {
             (&MODELS[2], "wholebody.pt", "wb15"),
         ] {
             let bytes = std::fs::read(var("AI_REF").join(weights)).unwrap();
-            let mut engine = engine(&model.build(&bytes).unwrap()).unwrap();
+            let device = match std::env::var("AI_DEVICE").as_deref() {
+                Ok("gpu") => Device::Gpu,
+                _ => Device::Cpu,
+            };
+            if std::env::var("AI_MODELS").is_ok_and(|m| !m.contains(reference)) {
+                continue;
+            }
+            let (mut engine, place) = engine(&model.build(&bytes).unwrap(), device).unwrap();
             let start = std::time::Instant::now();
             let mut blocks = 0;
             let got = segment(
@@ -494,7 +563,7 @@ mod tests {
             dice.sort_by(|x, y| x.0.total_cmp(&y.0));
             let mean = dice.iter().map(|d| d.0).sum::<f64>() / dice.len() as f64;
             println!(
-                "{}: {blocks} blocks in {seconds:.1} s; {} structures, mean Dice {mean:.4}, lowest {:?}",
+                "{} {place}: {blocks} blocks in {seconds:.1} s; {} structures, mean Dice {mean:.4}, lowest {:?}",
                 model.name,
                 dice.len(),
                 &dice[..dice.len().min(3)]
