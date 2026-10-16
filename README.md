@@ -223,6 +223,8 @@ every slice, and shows them solid in the 3D view, with the rest of the scan
 faint around them. The value under the pointer gains the name of the
 structure there. **Show labels** (G) hides and shows them all.
 
+![The whole-body model's structures in 3D, named, with the structures panel on the right](docs/structures.png)
+
 A panel on the right lists the structures found, in the model's order,
 each with its colour:
 
@@ -236,6 +238,21 @@ each with its colour:
   **Always** names every structure shown, largest first, where there is
   room; in 3D a name is faint when another structure stands in front of
   it.
+- **Smooth in 3D**, on by default, draws each structure in 3D with a
+  smooth surface rather than as voxels. Untick it to see the voxels as the
+  model gave them.
+
+The smooth surfaces come from distance fields. For every voxel the viewer
+works out how far it lies inside its structure, across its slice. Between
+voxels, and between slices, the 3D view blends those distances, and the
+surface is where the blend crosses zero. So each slice's outline turns
+smoothly into the next, and a structure closes in a low dome where it
+ends, rather than in a flat step. The light falls on the slope of the
+blend. The built-in whole-body models work on a 3 or 1.5 mm grid, coarser
+than most scans, and their labels come back in blocks of several pixels,
+as MONAI's own code returns them. Before the distances are worked out,
+each structure is blurred at the scale of those blocks, so the 3D view
+shows no terraces. The slices always show the model's own labels.
 
 #### Built-in models
 
@@ -355,6 +372,11 @@ files the viewer cannot read.
 The frame cache defaults to 2 GB. Set `QUICK_DICOM_CACHE_MB` to change it, for
 example `QUICK_DICOM_CACHE_MB=8000 quick_dicom /scans`.
 
+AI labels take 2 bytes a voxel, and up to 5 more for smooth surfaces. In
+3D they take 4 bytes a voxel on the GPU, 8 for a model with more than 255
+labels. For 300 slices of 512 × 512 that comes to at most 550 MB in memory
+and 315 MB on the GPU.
+
 ## Limits
 
 - It is a quick-look tool, not a diagnostic workstation.
@@ -369,6 +391,9 @@ example `QUICK_DICOM_CACHE_MB=8000 quick_dicom /scans`.
 - The 3D view has no tools to cut parts away: to see past bone, narrow the
   window or use MIP. With thick slices, smooth surfaces show faint steps
   where the slices were. Videos always show the 2D slices.
+- Smooth AI surfaces are a guess between slices. A structure that shifts
+  far from one slice to the next can break into pieces between them.
+  Untick **Smooth in 3D** to see only what the model found.
 - AI labels stay only while the viewer runs, one series at a time. Videos
   and MIP leave them out. Colour series cannot be segmented. The MONAI
   models are research tools, not cleared for diagnosis, and work best on
@@ -390,6 +415,7 @@ example `QUICK_DICOM_CACHE_MB=8000 quick_dicom /scans`.
 | `src/volume.wgsl`  | The 3D shaders: marches each ray through the volume front to back, applying window, colour map, opacity and lighting, or keeps the brightest value for MIP. Colours AI labels. |
 | `src/ai/`          | The built-in models: `torch.rs` reads PyTorch weights, `net.rs` rebuilds MONAI's UNet and SegResNet, `gpu.rs` and `gpu.wgsl` run them on the GPU, `onnx.rs` and `ort_cpu.rs` with ONNX Runtime, `pipeline.rs` prepares the scan and blends the cubes, `mod.rs` lists the models and downloads them. |
 | `src/monai.rs`     | Talks to a MONAI Label server on a background thread: lists its models, reads the series at full resolution, sends it, and reads back the labels.           |
+| `src/surface.rs`   | Smooth AI surfaces: blurs labels made in blocks, measures each voxel's distance inside its structure and from those above and below, and works out on the CPU what the 3D view draws, for names under the pointer. |
 | `src/nifti.rs`     | Writes the series as a NIfTI volume, with its position in the patient taken from the DICOM slice positions, and reads the labels the server returns.       |
 | `src/colormap.rs`  | The colour maps, with twins in `src/common.wgsl` for the GPU.                                                                                               |
 | `src/filter.rs`    | Denoising and sharpening: measures each image's noise, runs the GPU passes, and does the same on the CPU for videos.                                        |

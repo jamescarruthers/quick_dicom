@@ -26,8 +26,10 @@ pub struct VolumeUniforms {
     pub wl: [f32; 4],
     pub look: [f32; 4],
     /// Segmentation labels shown (0 or 1), every how many of the labels'
-    /// slices the volume took one, and which labels are shown (a version
-    /// number, so a change redraws). Set by the renderer.
+    /// slices the volume took one, which labels are shown (a version
+    /// number, so a change redraws), and flags: 1 for smooth surfaces, 2
+    /// for labels stored in 16 bits. The renderer sets all but the first
+    /// flag.
     pub labels: [f32; 4],
 }
 
@@ -58,6 +60,8 @@ pub struct Scene {
     pub shading: bool,
     /// Two samples per voxel rather than one: smoother, at twice the cost.
     pub fine: bool,
+    /// Segmentation labels with smooth surfaces rather than as voxels.
+    pub smooth: bool,
 }
 
 impl VolumeUniforms {
@@ -93,7 +97,7 @@ impl VolumeUniforms {
                 0.0,
                 scene.shading as u8 as f32,
             ],
-            labels: [0.0; 4],
+            labels: [0.0, 0.0, 0.0, scene.smooth as u8 as f32],
         }
     }
 }
@@ -115,6 +119,7 @@ pub struct Projection {
     pivot: f32,
     /// The volume took every `stride`th of the labels' slices.
     stride: f32,
+    smooth: bool,
 }
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -134,6 +139,7 @@ impl Projection {
             gap: u.slices[0].max(1e-4),
             pivot: u.slices[1],
             stride: stride.max(1) as f32,
+            smooth: u.labels[3] as u32 & 1 != 0,
         }
     }
 
@@ -160,13 +166,20 @@ impl Projection {
 
     /// The shown label at a model point, as the shader finds it.
     fn label_at(&self, seg: &Segmentation, mask: &LabelMask, p: [f32; 3]) -> u16 {
-        let x = ((p[0] / self.dims[0] + 0.5) * seg.width as f32).floor();
-        let y = ((p[1] / self.dims[1] + 0.5) * seg.height as f32).floor();
-        let k = ((p[2] / self.gap + self.pivot) * self.stride).round();
-        if x < 0.0 || y < 0.0 || k < 0.0 {
-            return 0;
-        }
-        let id = seg.at(x as u32, y as u32, k as u32);
+        let g = [
+            (p[0] / self.dims[0] + 0.5) * seg.width as f32 - 0.5,
+            (p[1] / self.dims[1] + 0.5) * seg.height as f32 - 0.5,
+            (p[2] / self.gap + self.pivot) * self.stride,
+        ];
+        let id = if self.smooth {
+            crate::surface::smooth_label(seg, g).0
+        } else {
+            let [x, y, k] = g.map(|c| (c + 0.5).floor());
+            if x < 0.0 || y < 0.0 || k < 0.0 {
+                return 0;
+            }
+            seg.at(x as u32, y as u32, k as u32)
+        };
         if mask.shows(id) { id } else { 0 }
     }
 
@@ -278,9 +291,12 @@ pub struct VolumeRenderer {
     /// The segmentation labels as a 3D texture, or a single empty voxel.
     labels: wgpu::BindGroup,
     mask: MaskTexture,
-    /// Which segmentation `labels` holds, or failed to hold.
-    labels_for: Option<u64>,
+    /// Which segmentation `labels` holds, or failed to hold, and whether
+    /// smoothed.
+    labels_for: Option<(u64, bool)>,
     labels_ok: bool,
+    /// Labels stored in 16 bits rather than 8, so 64 bits a voxel.
+    labels_wide: bool,
     /// The volume on the GPU, to tell when a new one needs uploading.
     uploaded: Option<Arc<Volume>>,
     offscreen: Option<Offscreen>,
@@ -456,7 +472,7 @@ impl VolumeRenderer {
                 device,
                 &labels_layout,
                 [1, 1, 1],
-                wgpu::TextureFormat::R8Uint,
+                wgpu::TextureFormat::R32Uint,
                 &mask.view,
             )
             .1,
@@ -464,6 +480,7 @@ impl VolumeRenderer {
             mask,
             labels_for: None,
             labels_ok: false,
+            labels_wide: false,
             uploaded: None,
             offscreen: None,
             drawn: None,
@@ -617,23 +634,31 @@ impl VolumeRenderer {
         });
     }
 
-    /// Put segmentation labels on the GPU as a 3D texture, as bytes when
-    /// every label fits in one. Fails, rather than crashing, when the GPU
-    /// has no room for them.
+    /// Put segmentation labels on the GPU as a 3D texture, smoothed or as
+    /// the model gave them, each with its three distances: in 32 bits when
+    /// every label fits in a byte, else 64. Fails, rather than crashing,
+    /// when the GPU has no room for them.
     fn upload_labels(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         seg: &Segmentation,
+        smooth: bool,
     ) -> Result<(), String> {
-        self.labels_for = Some(seg.id);
+        self.labels_for = Some((seg.id, smooth));
+        let labels = if smooth {
+            seg.surface_labels()
+        } else {
+            &seg.voxels
+        };
         self.labels_ok = false;
         self.drawn = None;
         let wide = seg.max_label() > 255;
+        self.labels_wide = wide;
         let format = if wide {
-            wgpu::TextureFormat::R16Uint
+            wgpu::TextureFormat::Rg32Uint
         } else {
-            wgpu::TextureFormat::R8Uint
+            wgpu::TextureFormat::R32Uint
         };
         let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -644,12 +669,26 @@ impl VolumeRenderer {
             format,
             &self.mask.view,
         );
+        let plane = (seg.width * seg.height) as usize;
         for k in 0..seg.depth as usize {
-            let slice = seg.slice(k);
+            let slice = &labels[k * plane..(k + 1) * plane];
+            let distances = &seg.distances[k * plane..(k + 1) * plane];
+            let voxels = slice.iter().zip(distances);
             let bytes: Vec<u8> = if wide {
-                bytemuck::cast_slice(slice).to_vec()
+                voxels
+                    .flat_map(|(&v, &[own, up, down])| {
+                        let label = v as u32 | (own as u32) << 16;
+                        let across = up as u32 | (down as u32) << 8;
+                        [label.to_le_bytes(), across.to_le_bytes()]
+                    })
+                    .flatten()
+                    .collect()
             } else {
-                slice.iter().map(|&v| v as u8).collect()
+                voxels
+                    .flat_map(|(&v, &d)| {
+                        u32::from_le_bytes([v as u8, d[0], d[1], d[2]]).to_le_bytes()
+                    })
+                    .collect()
             };
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
@@ -665,7 +704,7 @@ impl VolumeRenderer {
                 &bytes,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(seg.width * if wide { 2 } else { 1 }),
+                    bytes_per_row: Some(seg.width * if wide { 8 } else { 4 }),
                     rows_per_image: Some(seg.height),
                 },
                 wgpu::Extent3d {
@@ -718,8 +757,9 @@ impl VolumeRenderer {
         }
         if let Some((seg, mask)) = labels {
             self.mask.update(queue, mask);
-            if self.labels_for != Some(seg.id)
-                && let Err(e) = self.upload_labels(device, queue, seg)
+            let smooth = uniforms.labels[3] as u32 & 1 != 0;
+            if self.labels_for != Some((seg.id, smooth))
+                && let Err(e) = self.upload_labels(device, queue, seg, smooth)
             {
                 notice = Some(e);
             }
@@ -731,7 +771,8 @@ impl VolumeRenderer {
             && self.labels_ok
         {
             let version = (mask.generation % (1 << 24)) as f32;
-            u.labels = [1.0, volume.stride as f32, version, 0.0];
+            let flags = (u.labels[3] as u32 & 1) | if self.labels_wide { 2 } else { 0 };
+            u.labels = [1.0, volume.stride as f32, version, flags as f32];
         }
         queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&u));
 
@@ -779,7 +820,7 @@ impl VolumeRenderer {
     }
 }
 
-/// A 3D texture of labels, R8Uint or R16Uint, with its bind group. A new
+/// A 3D texture of labels, R32Uint or Rg32Uint, with its bind group. A new
 /// texture is all zeros.
 fn label_volume(
     device: &wgpu::Device,
@@ -910,14 +951,10 @@ mod tests {
         Arc::new(Volume::from_values(32, 32, 32, &values))
     }
 
-    /// Names go where the ray caster draws: the label under a voxel's
-    /// place in the view is that voxel's, from any angle, and one structure
-    /// in front of another hides it.
-    #[test]
-    fn projection_agrees_with_the_line_of_sight() {
-        // Labels at twice the volume's resolution across: label 5 a block
-        // in front (low slices are nearer the viewer face on), label 6 one
-        // straight behind it, label 7 off to the side.
+    /// Labels at twice the volume's resolution across: label 5 a block
+    /// in front (low slices are nearer the viewer face on), label 6 one
+    /// straight behind it, label 7 off to the side.
+    fn blocks() -> Segmentation {
         let (n, d) = (64usize, 32usize);
         let mut voxels = vec![0u16; n * n * d];
         let mut fill = |x: std::ops::Range<usize>,
@@ -935,40 +972,51 @@ mod tests {
         fill(20..30, 20..30, 4..8, 5);
         fill(20..30, 20..30, 20..24, 6);
         fill(44..54, 40..50, 10..14, 7);
-        let seg = Segmentation::new(String::new(), String::new(), [n, n, d], voxels, Vec::new());
+        Segmentation::new(String::new(), String::new(), [n, n, d], voxels, Vec::new())
+    }
+
+    /// Names go where the ray caster draws: the label under a voxel's
+    /// place in the view is that voxel's, from any angle, and one structure
+    /// in front of another hides it; with smooth surfaces or without.
+    #[test]
+    fn projection_agrees_with_the_line_of_sight() {
+        let seg = blocks();
         let all = LabelMask::hiding(&Default::default());
         let anchor = |l: u16| seg.structures.iter().find(|s| s.label == l).unwrap().anchor;
-        for (yaw, pitch) in [(0.0, 0.0), (0.6, -0.3), (2.0, 0.4)] {
-            let scene = Scene {
-                yaw,
-                pitch,
-                ..scene()
-            };
+        for smooth in [false, true] {
+            for (yaw, pitch) in [(0.0, 0.0), (0.6, -0.3), (2.0, 0.4)] {
+                let scene = Scene {
+                    yaw,
+                    pitch,
+                    smooth,
+                    ..scene()
+                };
+                let u = VolumeUniforms::new(&scene, 32.0, 32.0, 32.0);
+                let p = Projection::new(&scene, &u, 1);
+                let at = p.voxel_in_view(&seg, anchor(7));
+                assert_eq!(p.label_under(&seg, &all, at), Some(7), "yaw {yaw}");
+            }
+            let scene = Scene { smooth, ..scene() };
             let u = VolumeUniforms::new(&scene, 32.0, 32.0, 32.0);
             let p = Projection::new(&scene, &u, 1);
-            let at = p.voxel_in_view(&seg, anchor(7));
-            assert_eq!(p.label_under(&seg, &all, at), Some(7), "yaw {yaw}");
+            // Face on, the front block covers the one behind.
+            assert_eq!(
+                p.label_under(&seg, &all, p.voxel_in_view(&seg, anchor(6))),
+                Some(5)
+            );
+            assert!(p.behind_another(&seg, &all, 6, anchor(6)));
+            assert!(!p.behind_another(&seg, &all, 5, anchor(5)));
+            assert!(!p.behind_another(&seg, &all, 7, anchor(7)));
+            // Hiding the front block uncovers the other.
+            let hidden = LabelMask::hiding(&[5].into_iter().collect());
+            assert_eq!(
+                p.label_under(&seg, &hidden, p.voxel_in_view(&seg, anchor(6))),
+                Some(6)
+            );
+            assert!(!p.behind_another(&seg, &hidden, 6, anchor(6)));
+            // Off the volume, nothing.
+            assert_eq!(p.label_under(&seg, &all, (1.0, 1.0)), None);
         }
-        let scene = scene();
-        let u = VolumeUniforms::new(&scene, 32.0, 32.0, 32.0);
-        let p = Projection::new(&scene, &u, 1);
-        // Face on, the front block covers the one behind.
-        assert_eq!(
-            p.label_under(&seg, &all, p.voxel_in_view(&seg, anchor(6))),
-            Some(5)
-        );
-        assert!(p.behind_another(&seg, &all, 6, anchor(6)));
-        assert!(!p.behind_another(&seg, &all, 5, anchor(5)));
-        assert!(!p.behind_another(&seg, &all, 7, anchor(7)));
-        // Hiding the front block uncovers the other.
-        let hidden = LabelMask::hiding(&[5].into_iter().collect());
-        assert_eq!(
-            p.label_under(&seg, &hidden, p.voxel_in_view(&seg, anchor(6))),
-            Some(6)
-        );
-        assert!(!p.behind_another(&seg, &hidden, 6, anchor(6)));
-        // Off the volume, nothing.
-        assert_eq!(p.label_under(&seg, &all, (1.0, 1.0)), None);
     }
 
     /// The cube in a 64-pixel view, 1.5 pixels per voxel, all the way
@@ -990,6 +1038,7 @@ mod tests {
             maximum: false,
             shading: false,
             fine: true,
+            smooth: false,
         }
     }
 
@@ -1181,6 +1230,13 @@ mod tests {
                 },
                 "tilted and shaded",
             ),
+            (
+                Scene {
+                    smooth: true,
+                    ..scene()
+                },
+                "smooth",
+            ),
         ] {
             let image = render_rgba(
                 &mut renderer,
@@ -1237,5 +1293,85 @@ mod tests {
             "hidden: {:?}",
             image[15 * 64 + 15]
         );
+    }
+    /// The shader's smooth surfaces are where the CPU's copy of its sums
+    /// puts them: from an angle, each pixel shows the label the CPU finds
+    /// under it. On the edges the rays, which step a voxel at a time, may
+    /// miss a sliver that the CPU, stepping half that, finds. Skipped when
+    /// there is no GPU.
+    #[test]
+    fn smooth_surfaces_match_the_cpu() {
+        let Some((adapter, device, queue)) = testing::gpu() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let mut renderer = VolumeRenderer::new(&device, &adapter, wgpu::TextureFormat::Rgba8Unorm);
+        // A dark scan, so the labels show in their own colours.
+        let volume = Arc::new(Volume::from_values(32, 32, 32, &vec![0.0; 32 * 32 * 32]));
+        let seg = blocks();
+        let all = LabelMask::hiding(&Default::default());
+        let colours: Vec<(u16, [f32; 3])> = [5, 6, 7]
+            .into_iter()
+            .map(|l| (l, crate::colormap::label_colour(l).map(|v| v * 255.0)))
+            .collect();
+        for (yaw, pitch) in [(0.6, -0.3), (2.0, 0.4)] {
+            let scene = Scene {
+                yaw,
+                pitch,
+                smooth: true,
+                ..scene()
+            };
+            let image = render_rgba(
+                &mut renderer,
+                &device,
+                &queue,
+                &volume,
+                &scene,
+                Some((&seg, &all)),
+            );
+            let u = VolumeUniforms::new(&scene, 32.0, 32.0, 32.0);
+            let p = Projection::new(&scene, &u, 1);
+            let want: Vec<Option<u16>> = (0..64 * 64)
+                .map(|i| p.label_under(&seg, &all, ((i % 64) as f32 + 0.5, (i / 64) as f32 + 0.5)))
+                .collect();
+            let (mut inner, mut edges, mut missed) = (0, 0, 0);
+            for y in 1..63 {
+                for x in 1..63 {
+                    let px = image[y * 64 + x];
+                    // What the pixel shows: a label's colour, or black.
+                    let near = colours
+                        .iter()
+                        .map(|(l, c)| {
+                            let d: f32 = (0..3).map(|k| (px[k] as f32 - c[k]).powi(2)).sum();
+                            (d, *l)
+                        })
+                        .min_by(|a, b| a.0.total_cmp(&b.0))
+                        .unwrap();
+                    let shown = if near.0 < 30.0 * 30.0 {
+                        Some(near.1)
+                    } else if px[..3].iter().all(|&c| c < 10) {
+                        None
+                    } else {
+                        continue;
+                    };
+                    let w = want[y * 64 + x];
+                    let edge = [(0, 1), (2, 1), (1, 0), (1, 2)]
+                        .iter()
+                        .any(|&(i, j)| want[(y + j - 1) * 64 + x + i - 1] != w);
+                    if edge {
+                        edges += 1;
+                        missed += (shown != w) as usize;
+                    } else {
+                        inner += w.is_some() as usize;
+                        assert_eq!(shown, w, "yaw {yaw}: pixel ({x}, {y}) {px:?}");
+                    }
+                }
+            }
+            assert!(inner > 80, "yaw {yaw}: {inner} labelled pixels inside");
+            assert!(
+                missed * 3 < edges,
+                "yaw {yaw}: {missed} of {edges} edge pixels disagree"
+            );
+        }
     }
 }

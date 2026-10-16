@@ -50,6 +50,14 @@ pub struct Segmentation {
     pub found: Vec<u16>,
     /// What each label that occurs covers, in the same order.
     pub structures: Vec<Structure>,
+    /// The labels with the steps of the model's blocks taken out, for
+    /// smooth surfaces in 3D; none when the model worked at the scan's
+    /// scale. See `surface::smooth_labels`.
+    pub smoothed: Option<Vec<u16>>,
+    /// How far each voxel lies inside its own region of those labels, and
+    /// from the structures above and below it, across its slice: what
+    /// smooths the surfaces in 3D. See `surface::distances`.
+    pub distances: Vec<[u8; 3]>,
 }
 
 /// Where one label lies.
@@ -75,7 +83,26 @@ impl Segmentation {
         voxels: Vec<u16>,
         names: Vec<(u16, String)>,
     ) -> Self {
+        Self::made_at(key, model, dims, voxels, names, [1.0; 3])
+    }
+
+    /// A segmentation from a model that made its labels in blocks of
+    /// `blocks` scan voxels along each axis.
+    pub fn made_at(
+        key: String,
+        model: String,
+        dims: [usize; 3],
+        voxels: Vec<u16>,
+        names: Vec<(u16, String)>,
+        blocks: [f32; 3],
+    ) -> Self {
         let structures = structures(&voxels, dims);
+        let sigma = crate::surface::blur_for(blocks);
+        let smoothed = sigma
+            .iter()
+            .any(|&s| s > 0.0)
+            .then(|| crate::surface::smooth_labels(&voxels, dims, sigma));
+        let distances = crate::surface::distances(smoothed.as_deref().unwrap_or(&voxels), dims);
         Segmentation {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             key,
@@ -87,6 +114,8 @@ impl Segmentation {
             names,
             found: structures.iter().map(|s| s.label).collect(),
             structures,
+            smoothed,
+            distances,
         }
     }
 
@@ -107,6 +136,11 @@ impl Segmentation {
             .iter()
             .find(|(id, _)| *id == label)
             .map_or_else(|| format!("label {label}"), |(_, n)| n.clone())
+    }
+
+    /// The labels the 3D view's smooth surfaces follow.
+    pub fn surface_labels(&self) -> &[u16] {
+        self.smoothed.as_deref().unwrap_or(&self.voxels)
     }
 
     /// The largest label, which decides how the GPU stores them.

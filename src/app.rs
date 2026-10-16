@@ -140,6 +140,8 @@ struct Monai {
     mask: Arc<LabelMask>,
     /// When to name structures on the image and in 3D.
     names: Names,
+    /// Smooth surfaces on structures in 3D, rather than voxels.
+    smooth: bool,
     /// Narrows the list of structures.
     filter: String,
     /// The current slice's structures and where their names go, kept
@@ -195,6 +197,7 @@ impl Default for Monai {
             names: Names::Hover,
             filter: String::new(),
             slice_names: None,
+            smooth: true,
         }
     }
 }
@@ -1112,6 +1115,9 @@ impl ViewerApp {
             ui.selectable_value(&mut m.names, Names::Always, "Always")
                 .on_hover_text("Name every structure shown, where there is room");
         });
+        ui.checkbox(&mut m.smooth, "Smooth in 3D").on_hover_text(
+            "Round off the voxel steps on structures in 3D. Untick to see the voxels as the model gave them.",
+        );
         if seg.structures.len() > 8 {
             ui.add(
                 egui::TextEdit::singleline(&mut m.filter)
@@ -1947,6 +1953,7 @@ impl ViewerApp {
             maximum,
             shading: self.three_d.shading,
             fine: !moving,
+            smooth: self.monai.smooth,
         };
         let (wc, ww) = scene.window;
         let uniforms = VolumeUniforms::new(&scene, w, h, d);
