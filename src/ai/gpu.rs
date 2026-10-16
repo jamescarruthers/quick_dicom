@@ -306,6 +306,20 @@ impl GpuNet {
                 slot_of[i] = take(bytes, &mut slots, &mut free)?;
             }
             let y = slot_of[i];
+            // Layer sizes above assume a transposed convolution doubles.
+            if let Op::ConvTranspose {
+                k,
+                stride,
+                pad,
+                out_pad,
+                ..
+            } = layer.op
+                && (stride != 2 || out_pad != 1 || k != 2 * pad + 1)
+            {
+                return Err(
+                    "the GPU code handles only transposed convolutions that double the size".into(),
+                );
+            }
             match &layer.op {
                 Op::Input => input = y,
                 Op::Conv {
